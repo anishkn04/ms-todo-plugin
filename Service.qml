@@ -657,15 +657,13 @@ Item {
   }
 
   Component.onCompleted: {
-    // Migrate a pre-rename state tree (keeps an existing login), then seed
-    // the dir so FileView finds something on first run; the probes reload
-    // once seeding exits. Sync happens via the startup timer above.
+    // Seed the state dir so FileView finds something on first run; the
+    // probes reload once seeding exits. Sync happens via the startup timer
+    // above. The plugin only ever touches its own mstodo tree.
     seedProc.command = ["bash", "-c",
-      "s=\"$HOME/.local/state/omarchy\"; " +
-      "[[ -d \"$s/tasks\" && ! -e \"$s/mstodo\" ]] && mv \"$s/tasks\" \"$s/mstodo\"; " +
-      "mkdir -p \"$HOME/.local/state/omarchy/mstodo\"; " +
-      "f=\"$HOME/.local/state/omarchy/mstodo/notified.json\"; [[ -f \"$f\" ]] || printf '{}' > \"$f\"; " +
-      "f=\"$HOME/.local/state/omarchy/mstodo/pomo.json\"; [[ -f \"$f\" ]] || printf '{ \"dateKey\": \"\", \"blocks\": 0, \"minutes\": 0 }' > \"$f\""]
+      "d=\"$HOME/.local/state/omarchy/mstodo\"; mkdir -p \"$d\"; " +
+      "f=\"$d/notified.json\"; [[ -f \"$f\" ]] || printf '{}' > \"$f\"; " +
+      "f=\"$d/pomo.json\"; [[ -f \"$f\" ]] || printf '{ \"dateKey\": \"\", \"blocks\": 0, \"minutes\": 0 }' > \"$f\""]
     seedProc.running = true
   }
 

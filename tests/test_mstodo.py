@@ -317,6 +317,39 @@ class TokenLogic(unittest.TestCase):
         self.assertGreater(task["due"], task["remind"])
 
 
+class FakeResponse:
+    """Minimal stand-in for an urlopen() context result."""
+
+    def __init__(self, payload: bytes):
+        self.payload = payload
+
+    def read(self, n=-1) -> bytes:
+        if n < 0:
+            out, self.payload = self.payload, b""
+            return out
+        out, self.payload = self.payload[:n], self.payload[n:]
+        return out
+
+
+class BodyLimits(unittest.TestCase):
+    """Responses are read under a hard cap, never unbounded."""
+
+    def test_read_body_limited_within(self):
+        self.assertEqual(cli.read_body_limited(FakeResponse(b'{"a": 1}'), 100), '{"a": 1}')
+
+    def test_read_body_limited_exact(self):
+        body = b"x" * 100
+        self.assertEqual(cli.read_body_limited(FakeResponse(body), 100), body.decode())
+
+    def test_read_body_limited_rejects_oversize(self):
+        with self.assertRaises(cli.ApiError):
+            cli.read_body_limited(FakeResponse(b"x" * 101), 100)
+
+    def test_error_bytes_cap_constant(self):
+        self.assertEqual(cli.MAX_ERROR_BYTES, 64 * 1024)
+        self.assertEqual(cli.MAX_RESPONSE_BYTES, 4 * 1024 * 1024)
+
+
 class DeviceFlow(unittest.TestCase):
     """login start / login poll as separate machine steps, no network."""
 
@@ -329,9 +362,6 @@ class DeviceFlow(unittest.TestCase):
         os.makedirs(cli.STATE_DIR, exist_ok=True)
         self._sync_orig = cli.cmd_sync
         cli.cmd_sync = lambda args: 0
-        # Keep the handlers away from the real state tree.
-        self._migrate_orig = cli.migrate_state_dir
-        cli.migrate_state_dir = lambda: None
         # _poll_once mutates the module-global tenant authority; reset it.
         cli.set_authority("common")
 
@@ -340,7 +370,6 @@ class DeviceFlow(unittest.TestCase):
         shutil.rmtree(cli.STATE_DIR, ignore_errors=True)
         cli.STATE_DIR = self.old_state
         cli.cmd_sync = self._sync_orig
-        cli.migrate_state_dir = self._migrate_orig
         cli.set_authority("common")
         if hasattr(self, "_http_orig"):
             cli.http_form = self._http_orig

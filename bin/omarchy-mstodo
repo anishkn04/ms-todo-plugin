@@ -91,22 +91,21 @@ CONFIG_PATH = os.path.join(STATE_DIR, "config.json")
 LOGIN_PATH = os.path.join(STATE_DIR, "login.json")
 
 
-def migrate_state_dir() -> None:
-    """Move the pre-rename ~/.local/state/omarchy/tasks tree (tokens, cache,
-    reminder bookkeeping) so an existing install keeps its session."""
-    legacy = os.path.join(
-        os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
-        "omarchy", "tasks",
-    )
-    if os.path.isdir(legacy) and not os.path.exists(STATE_DIR):
-        try:
-            os.makedirs(os.path.dirname(STATE_DIR), exist_ok=True)
-            os.replace(legacy, STATE_DIR)
-        except OSError:
-            pass
-
 MAX_TASKS_FETCH = 250
 HTTP_TIMEOUT = 30
+# Microsoft endpoints return small JSON documents, but a hostile or broken
+# peer must not control how much memory a bar plugin reads. Error payloads
+# are tiny by spec; anything longer is truncated before parsing.
+MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_ERROR_BYTES = 64 * 1024
+
+
+def read_body_limited(resp, limit: int = MAX_RESPONSE_BYTES) -> str:
+    """Read at most `limit` bytes; raise ApiError when the peer sends more."""
+    data = resp.read(limit + 1)
+    if len(data) > limit:
+        raise ApiError(f"response body exceeded {limit} bytes")
+    return data.decode()
 
 
 class AuthRequired(Exception):
@@ -440,10 +439,10 @@ def http_form(url: str, fields: dict) -> dict:
     })
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-            return json.loads(resp.read().decode())
+            return json.loads(read_body_limited(resp))
     except urllib.error.HTTPError as exc:
         try:
-            payload = json.loads(exc.read().decode())
+            payload = json.loads(exc.read(MAX_ERROR_BYTES).decode())
         except ValueError:
             payload = {}
         error = payload.get("error", f"HTTP {exc.code}")
@@ -553,7 +552,6 @@ def _poll_once(pending: dict) -> dict:
 
 def cmd_login_start(args) -> int:
     """Machine step 1: get a device code, persist it, print it as JSON."""
-    migrate_state_dir()
     cid = os.environ.get("OMARCHY_MSTODO_CLIENT_ID") or DEFAULT_CLIENT_ID
     try:
         challenge = _start_challenge(cid)
@@ -577,7 +575,6 @@ def cmd_login_start(args) -> int:
 
 def cmd_login_poll(args) -> int:
     """Machine step 2: one poll; prints exactly one JSON status object."""
-    migrate_state_dir()
     result = _poll_once(_load_pending())
     if result["status"] == "success":
         # Best effort: land the first cache immediately so the bar flips out
@@ -588,7 +585,6 @@ def cmd_login_poll(args) -> int:
 
 
 def cmd_login_cancel(args) -> int:
-    migrate_state_dir()
     _drop_pending()
     print(json.dumps({"status": "cancelled"}))
     return 0
@@ -607,7 +603,6 @@ def cmd_login(args) -> int:
 
 def _login_interactive(_args) -> int:
     """Human flow in one process: prints the code, polls until done."""
-    migrate_state_dir()
     cid = os.environ.get("OMARCHY_MSTODO_CLIENT_ID") or DEFAULT_CLIENT_ID
     try:
         challenge = _start_challenge(cid)
@@ -655,7 +650,6 @@ def _login_interactive(_args) -> int:
 
 
 def cmd_logout(_args) -> int:
-    migrate_state_dir()
     for path in (AUTH_PATH, LOGIN_PATH):
         try:
             os.remove(path)
@@ -681,11 +675,11 @@ def graph_request(method: str, path: str, body: dict | None = None, params: dict
     })
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-            raw = resp.read().decode()
+            raw = read_body_limited(resp)
             return json.loads(raw) if raw.strip() else {}
     except urllib.error.HTTPError as exc:
         try:
-            payload = json.loads(exc.read().decode())
+            payload = json.loads(exc.read(MAX_ERROR_BYTES).decode())
         except ValueError:
             payload = {}
         message = payload.get("error", {}).get("message", f"HTTP {exc.code}")
@@ -1193,7 +1187,6 @@ def main(argv: list[str]) -> int:
         parser.print_help()
         return 2
     try:
-        migrate_state_dir()
         return handlers[args.command](args)
     except SystemExitWith as exc:
         print(exc.message, file=sys.stderr)

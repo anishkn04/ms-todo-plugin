@@ -41,7 +41,7 @@ BarWidget {
   // The bar IS the next commitment: "11:30 Work / Program #1". No icon, no
   // bare count. When today is clear, a dimmed word beats an empty slot.
   readonly property string nextLine: {
-    var line = service ? String(service.nextBarLine) : ""
+    var line = Model.plain(service ? String(service.nextBarLine) : "")
     if (root.vertical) return Model.elide(line, 12)
     return Model.elide(line, 34)
   }

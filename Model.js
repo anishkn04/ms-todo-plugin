@@ -38,6 +38,14 @@ function elide(text, max) {
   return s.length > max ? s.slice(0, Math.max(0, max - 1)) + "\u2026" : s
 }
 
+// Shell-owned widgets (WidgetButton labels, tooltips, OpticalGlyph) render
+// Text in Qt's default AutoText mode, which interprets markup-looking
+// input. Microsoft-sourced strings are stripped of markup-significant
+// characters before crossing that boundary.
+function plain(text) {
+  return String(text || "").replace(/[<>&]/g, "")
+}
+
 // ---- cache ---------------------------------------------------------------
 
 function parseJson(text) {

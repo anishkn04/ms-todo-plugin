@@ -352,6 +352,7 @@ Panel {
               spacing: Style.space(2)
 
               Text {
+                textFormat: Text.PlainText
                 text: root.listName !== "" ? "To Do \u00b7 " + root.listName : "To Do"
                 color: root.fg
                 font.family: root.contentFontFamily
@@ -367,6 +368,7 @@ Panel {
                   else if (root.account !== "") bits.push(root.account)
                   return bits.join(" \u00b7 ")
                 }
+                textFormat: Text.PlainText
                 visible: !root.signedIn || text !== ""
                 color: root.muted
                 font.family: root.contentFontFamily
@@ -400,6 +402,7 @@ Panel {
           // ---- status: error first; the undo window yields ---------------
           Text {
             width: parent.width
+            textFormat: Text.PlainText
             visible: root.actionError !== ""
             text: root.actionError
             color: root.urgent
@@ -417,6 +420,7 @@ Panel {
 
             Text {
               id: undoText
+              textFormat: Text.PlainText
               anchors.centerIn: parent
               color: root.muted
               font.family: root.contentFontFamily
@@ -463,6 +467,7 @@ Panel {
 
           // Live grammar preview: only while typing, never as standing chrome.
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             visible: root.signedIn && quickAdd.activeFocus
               && Model.previewFor(quickAdd.text, Date.now()) !== ""
@@ -482,6 +487,7 @@ Panel {
 
             Text {
               width: parent.width
+              textFormat: Text.PlainText
               text: root.authRequired
                 ? "Session expired \u2014 sign in again"
                 : "Connect your Microsoft account"
@@ -505,6 +511,7 @@ Panel {
 
             Text {
               width: parent.width
+              textFormat: Text.PlainText
               visible: root.loginError !== ""
               text: root.loginError
               color: root.urgent
@@ -521,6 +528,7 @@ Panel {
 
               Text {
                 width: parent.width
+                textFormat: Text.PlainText
                 text: "Enter this code at microsoft.com/link:"
                 color: root.muted
                 font.family: root.contentFontFamily
@@ -529,6 +537,7 @@ Panel {
 
               Text {
                 width: parent.width
+                textFormat: Text.PlainText
                 horizontalAlignment: Text.AlignHCenter
                 text: root.loginCode
                 color: root.accent
@@ -579,6 +588,7 @@ Panel {
 
               Text {
                 width: parent.width
+                textFormat: Text.PlainText
                 visible: root.loginExpiresLabel !== ""
                 text: root.loginExpiresLabel + " \u00b7 waiting for approval\u2026"
                 color: root.muted
@@ -591,6 +601,7 @@ Panel {
           // ---- empty state ----------------------------------------------
           Text {
             width: parent.width
+            textFormat: Text.PlainText
             visible: root.signedIn && root.flatRows.length === 0
             text: "Nothing open.\nType above \u2014 @tomorrow 09:00 repeat daily works."
             color: root.muted
@@ -679,6 +690,7 @@ Panel {
 
               // Header / more rows
               Text {
+                textFormat: Text.PlainText
                 anchors.left: parent.left
                 anchors.verticalCenter: parent.verticalCenter
                 visible: rowRoot.isHeader
@@ -691,6 +703,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 anchors.left: parent.left
                 anchors.verticalCenter: parent.verticalCenter
                 visible: rowRoot.isMore
@@ -723,6 +736,7 @@ Panel {
                   border.width: 1
 
                   Text {
+                    textFormat: Text.PlainText
                     anchors.centerIn: parent
                     visible: rowRoot.isHeld
                     text: "\u2713"
@@ -749,6 +763,7 @@ Panel {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   anchors.verticalCenter: parent.verticalCenter
                   width: parent.width
                     - checkCircle.width - metaText.implicitWidth - parent.spacing * 2
@@ -764,6 +779,7 @@ Panel {
 
                 Text {
                   id: metaText
+                  textFormat: Text.PlainText
                   anchors.verticalCenter: parent.verticalCenter
                   text: rowRoot.isTask ? root.metaLine(rowRoot.task) : ""
                   color: rowRoot.overdue ? root.urgent : root.muted
@@ -794,6 +810,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 anchors.right: parent.right
                 anchors.baseline: focusTitle.baseline
                 text: Model.pomoStatsLabel(root.svc ? root.svc.pomoState : null).toUpperCase()
@@ -817,6 +834,7 @@ Panel {
                 spacing: Style.space(8)
 
                 Text {
+                  textFormat: Text.PlainText
                   anchors.verticalCenter: parent.verticalCenter
                   text: root.pomoPhase === "idle"
                     ? Model.formatClock(Model.pomoPhaseSeconds("focus", root.pomoPrefs))
@@ -828,6 +846,7 @@ Panel {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   anchors.verticalCenter: parent.verticalCenter
                   text: root.pomoPhase === "idle"
                     ? "ready"
@@ -898,6 +917,7 @@ Panel {
                 spacing: Style.space(8)
 
                 Text {
+                  textFormat: Text.PlainText
                   width: Style.space(64)
                   horizontalAlignment: Text.AlignRight
                   text: modelData[0]
@@ -908,6 +928,7 @@ Panel {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   text: modelData[1]
                   color: root.muted
                   font.family: root.contentFontFamily
