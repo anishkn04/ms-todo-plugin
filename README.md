@@ -17,6 +17,14 @@ omarchy plugin add https://github.com/anishkn04/ms-todo-plugin.git --enable
 
 A dimmed `setup` slot appears on the bar. Click it to sign in.
 
+## Dependencies
+
+- `libnotify` (`notify-send`) — desktop reminders and focus-timer toasts.
+- `wl-clipboard` (`wl-copy`) — the sign-in card's copy-code button.
+
+Both ship with Omarchy. The CLI itself is stdlib-only Python — nothing to
+pip install.
+
 ## Sign in
 
 Click the bar slot and hit **Sign in with Microsoft**. The panel shows a
@@ -163,6 +171,16 @@ reminder's time whenever it falls on the due date.
   queue.
 - Graph rate limits (429) and network failures surface as a red line in the
   panel footer, never as crashes.
+
+## Remove
+
+```sh
+omarchy plugin remove anishkn.mstodo
+```
+
+Tokens and cached data live outside the repo in
+`~/.local/state/omarchy/mstodo/`; delete that directory as well if you want
+a fully clean exit (it also logs you out of this device).
 
 ## Development
 
