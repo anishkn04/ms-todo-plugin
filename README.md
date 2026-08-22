@@ -6,6 +6,9 @@ timer (pomodoro) with local daily stats. Your phone keeps using Microsoft's
 own To Do app — its notifications are excellent and free, and this widget
 mirrors the same list on the desktop.
 
+> [!NOTE]
+> This project is fully AI generated.
+
 ## Install
 
 ```sh
@@ -186,6 +189,15 @@ qmllint -I "$OMARCHY_PATH/shell" BarWidget.qml Panel.qml Service.qml
 
 Saved changes under `~/.config/omarchy/plugins/` hot-reload; force discovery
 with `omarchy-shell shell rescanPlugins`.
+
+## Credits
+
+With thanks to [omarchy-ticktick](https://github.com/SotoAugusto/omarchy-ticktick)
+by [@SotoAugusto](https://github.com/SotoAugusto) — this plugin started as a
+study of its architecture: the Python CLI behind the shell (long-lived
+credentials in a 0600 file, serialized writes, cache-on-disk for QML) and
+the service state model are adapted from there, with the Microsoft Graph
+side built on top. If MS To Do isn't your thing, go check out TickTick.
 
 ## License
 
