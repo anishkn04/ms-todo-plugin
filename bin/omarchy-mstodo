@@ -8,11 +8,12 @@ the quick-add grammar is ordinary string parsing that is miserable to unit
 test in QML and trivial in Python. The shell only ever runs this binary and
 parses JSON.
 
-Auth is Microsoft's public device-code flow against the v2 common endpoint.
-The default client id reuses Microsoft Azure PowerShell's first-party public
-client, which accepts delegated Graph scopes for personal accounts; if a
-tenant rejects it, register a free app (README) and put its id in
-OMARCHY_MSTODO_CLIENT_ID or auth.json's "client_id".
+Auth is Microsoft's public device-code flow. The default tenant is /common;
+apps registered for personal accounts only are retried under /consumers and
+the choice is remembered. The bundled client id belongs to this plugin's
+own registered public app; if a tenant rejects it, register a free app
+(README) and put its id in OMARCHY_MSTODO_CLIENT_ID or auth.json's
+"client_id".
 
 All datetimes are sent as UTC instants ("timeZone": "UTC"); the cache stores
 epoch seconds so QML never parses ISO strings.
@@ -75,10 +76,10 @@ def set_authority(authority: str) -> None:
     AUTH_BASE = f"https://login.microsoftonline.com/{_AUTHORITY}/oauth2/v2.0"
 SCOPES = "Tasks.ReadWrite User.Read offline_access"
 
-# Registered public-client Azure app for this plugin (personal accounts).
-# Not a secret — client ids identify the app; override with
-# OMARCHY_MSTODO_CLIENT_ID or auth.json's "client_id" if you prefer your own.
-DEFAULT_CLIENT_ID = "1950a258-227b-4e31-a9cf-717495945fc2"  # TODO: replace with own app id
+# This plugin's registered public-client Azure app (personal accounts,
+# verified at anishkn.com.np). Not a secret — client ids only identify the
+# app; override with OMARCHY_MSTODO_CLIENT_ID or auth.json's "client_id".
+DEFAULT_CLIENT_ID = "71dc7ed7-c13e-453e-86da-fb2f6f8ab7cf"
 
 STATE_DIR = os.path.join(
     os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),

@@ -31,10 +31,11 @@ Prefer a terminal? The CLI drives the same flow:
 (Add `alias mstodo=...` to your shell if you'll use it often.)
 
 Tokens live in `~/.local/state/omarchy/mstodo/auth.json` with `0600`
-permissions; the task cache sits next to it. If your account type rejects
-the bundled client id, register a free app of your own (5 minutes) and set
-`OMARCHY_MSTODO_CLIENT_ID=<id>` for the first login — the id is then stored
-with your tokens:
+permissions; the task cache sits next to it. The plugin ships its own
+registered public client id (a client id identifies the app — it is not a
+secret). If your account type rejects it, register a free app of your own
+(5 minutes) and set `OMARCHY_MSTODO_CLIENT_ID=<id>` for the first login —
+the id is then stored with your tokens:
 
 1. portal.azure.com → **App registrations** → New registration
 2. Supported account types: **personal Microsoft accounts only**
