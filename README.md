@@ -22,8 +22,7 @@ A dimmed `setup` slot appears on the bar. Click it to sign in.
 - `libnotify` (`notify-send`) — desktop reminders and focus-timer toasts.
 - `wl-clipboard` (`wl-copy`) — the sign-in card's copy-code button.
 
-Both ship with Omarchy. The CLI itself is stdlib-only Python — nothing to
-pip install.
+Both ship with Omarchy. The CLI itself is stdlib-only Python — nothing to install.
 
 ## Sign in
 
