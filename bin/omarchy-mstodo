@@ -392,7 +392,9 @@ def load_json(path: str, fallback):
 
 
 def save_json_atomic(path: str, data) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    os.chmod(directory, 0o700)  # tokens live here; every caller writes under STATE_DIR
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=1)
@@ -419,12 +421,23 @@ def access_token(tokens: dict) -> str:
     if tokens.get("access_token") and time.time() < tokens.get("expires_at", 0) - 120:
         return tokens["access_token"]
     set_authority(tokens.get("authority", "common"))
-    refreshed = oauth_token_request({
-        "client_id": client_id(tokens),
-        "grant_type": "refresh_token",
-        "refresh_token": tokens["refresh_token"],
-        "scope": SCOPES,
-    })
+    try:
+        refreshed = oauth_token_request({
+            "client_id": client_id(tokens),
+            "grant_type": "refresh_token",
+            "refresh_token": tokens["refresh_token"],
+            "scope": SCOPES,
+        })
+    except ApiError as exc:
+        # A refused refresh (revoked grant, password change, tenant policy)
+        # is a sign-in state, not a transient API failure. Without this
+        # mapping the cache keeps claiming a live session the UI trusts.
+        if any(code in str(exc) for code in (
+            "invalid_grant", "interaction_required",
+            "consent_required", "unauthorized_client",
+        )):
+            raise AuthRequired("session expired — run 'omarchy-mstodo login'") from exc
+        raise
     merged = {**tokens, **refreshed}
     merged["expires_at"] = time.time() + refreshed.get("expires_in", 3600)
     save_json_atomic(AUTH_PATH, merged)
@@ -439,7 +452,8 @@ def http_form(url: str, fields: dict) -> dict:
     })
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-            return json.loads(read_body_limited(resp))
+            raw = read_body_limited(resp)
+            return json.loads(raw)
     except urllib.error.HTTPError as exc:
         try:
             payload = json.loads(exc.read(MAX_ERROR_BYTES).decode())
@@ -447,6 +461,11 @@ def http_form(url: str, fields: dict) -> dict:
             payload = {}
         error = payload.get("error", f"HTTP {exc.code}")
         raise ApiError(f"{error}: {payload.get('error_description', '')[:300]}") from exc
+    except ValueError as exc:
+        # UnicodeDecodeError is a ValueError; both mean the body lied about
+        # being JSON. Keep it a NetworkError so callers retry instead of
+        # dying on a traceback.
+        raise NetworkError(f"malformed token response: {str(exc)[:120]}") from exc
     except (urllib.error.URLError, OSError) as exc:
         raise NetworkError(str(exc)) from exc
 
@@ -550,6 +569,21 @@ def _poll_once(pending: dict) -> dict:
     return {"status": "success"}
 
 
+def _login_uri(challenge: dict) -> str:
+    """The device-code URL we hand to the browser, allowlisted: https on a
+    Microsoft sign-in host. Anything else from the response falls back to
+    the known-good https://microsoft.com/link."""
+    uri = challenge.get("verification_uri") or ""
+    parsed = urllib.parse.urlparse(uri)
+    if (parsed.scheme == "https"
+            and (parsed.hostname or "") in {
+                "microsoft.com", "www.microsoft.com",
+                "login.microsoftonline.com", "login.live.com",
+            }):
+        return uri
+    return "https://microsoft.com/link"
+
+
 def cmd_login_start(args) -> int:
     """Machine step 1: get a device code, persist it, print it as JSON."""
     cid = os.environ.get("OMARCHY_MSTODO_CLIENT_ID") or DEFAULT_CLIENT_ID
@@ -565,7 +599,7 @@ def cmd_login_start(args) -> int:
     pending = _save_pending(challenge, cid)
     print(json.dumps({
         "status": "started",
-        "verification_uri": challenge.get("verification_uri", "https://microsoft.com/link"),
+        "verification_uri": _login_uri(challenge),
         "user_code": challenge["user_code"],
         "interval": pending["interval"],
         "expires_in": int(challenge.get("expires_in", 900)),
@@ -613,7 +647,7 @@ def _login_interactive(_args) -> int:
         print(f"Network error: {exc}", file=sys.stderr)
         return 4
 
-    print(f"Open {challenge['verification_uri']} and enter code: {challenge['user_code']}",
+    print(f"Open {_login_uri(challenge)} and enter code: {challenge['user_code']}",
           file=sys.stderr)
     print("Waiting for approval...", file=sys.stderr)
 
@@ -694,8 +728,35 @@ def graph_request(method: str, path: str, body: dict | None = None, params: dict
             retry_after = exc.headers.get("Retry-After", "10")
             raise ApiError(f"rate limited, retry after {retry_after}s") from exc
         raise ApiError(message[:300]) from exc
+    except ValueError as exc:
+        raise NetworkError(f"malformed response body: {str(exc)[:120]}") from exc
     except (urllib.error.URLError, OSError) as exc:
         raise NetworkError(str(exc)) from exc
+
+
+def fetch_all_tasks(list_id: str) -> list[dict]:
+    """Every page of one list's tasks, capped at MAX_TASKS_FETCH overall.
+    Follows @odata.nextLink but only when it points back at the same Graph
+    v1.0 endpoint — a tampered or odd response must not redirect the sync."""
+    safe_list = urllib.parse.quote(str(list_id), safe="")
+    url = f"{GRAPH}/me/todo/lists/{safe_list}/tasks?$top={MAX_TASKS_FETCH}"
+    tasks: list[dict] = []
+    while len(tasks) < MAX_TASKS_FETCH:
+        payload = graph_request("GET", url[len(GRAPH):])
+        values = payload.get("value", [])
+        if not isinstance(values, list):
+            break
+        tasks.extend(values)
+        nxt = payload.get("@odata.nextLink")
+        if not isinstance(nxt, str):
+            break
+        parsed = urllib.parse.urlparse(nxt)
+        if (parsed.scheme != "https"
+                or (parsed.hostname or "") != "graph.microsoft.com"
+                or not parsed.path.startswith("/v1.0/")):
+            break
+        url = nxt
+    return tasks[:MAX_TASKS_FETCH]
 
 
 def pick_list(config: dict) -> dict:
@@ -719,11 +780,11 @@ def map_task(raw: dict) -> dict:
             return 0
         try:
             iso = dt_field.get("dateTime") or ""
-            tz = dt_field.get("timeZone", "UTC")
             dt = datetime.fromisoformat(iso)
-            if tz.upper() == "UTC":
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.timestamp()
+            # Only UTC is ever asserted by To Do for due dates; zone strings
+            # we don't interpret are pinned to UTC rather than drifting to
+            # whatever timezone the calling machine happens to have.
+            return dt.replace(tzinfo=timezone.utc).timestamp()
         except (ValueError, AttributeError):
             return 0
 
@@ -786,9 +847,7 @@ def cmd_sync(args) -> int:
 
     try:
         me = graph_request("GET", "/me").get("userPrincipalName", "")
-        tasks_raw = graph_request(
-            "GET", f"/me/todo/lists/{chosen['id']}/tasks", params={"$top": MAX_TASKS_FETCH},
-        ).get("value", [])
+        tasks_raw = fetch_all_tasks(chosen["id"])
     except AuthRequired:
         write_cache(syncedAt=now, authRequired=True)
         print("Session expired — run 'omarchy-mstodo login'", file=sys.stderr)
@@ -1002,7 +1061,10 @@ def mutate(method: str, task_id: str, body: dict | None = None) -> int:
     if not list_id:
         print("No cached list yet — run 'omarchy-mstodo sync' once.", file=sys.stderr)
         return 1
-    path = f"/me/todo/lists/{list_id}/tasks/{task_id}"
+    path = (
+        f"/me/todo/lists/{urllib.parse.quote(str(list_id), safe='')}"
+        f"/tasks/{urllib.parse.quote(str(task_id), safe='')}"
+    )
     try:
         if method == "DELETE":
             graph_request("DELETE", path)
@@ -1105,12 +1167,17 @@ def _create_or_update(task_id: str | None, line: str) -> int:
 
     body = build_task_payload(parsed)
     label = recur_label(parsed)
+    safe_list = urllib.parse.quote(str(list_id), safe="")
     try:
         if task_id:
-            graph_request("PATCH", f"/me/todo/lists/{list_id}/tasks/{task_id}", body=body)
+            graph_request(
+                "PATCH",
+                f"/me/todo/lists/{safe_list}/tasks/{urllib.parse.quote(str(task_id), safe='')}",
+                body=body,
+            )
         else:
             created = graph_request(
-                "POST", f"/me/todo/lists/{list_id}/tasks", body=body,
+                "POST", f"/me/todo/lists/{safe_list}/tasks", body=body,
             )
             print(json.dumps({
                 "id": created.get("id", ""),

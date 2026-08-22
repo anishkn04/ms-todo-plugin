@@ -251,7 +251,7 @@ Item {
           return
         }
         root.loginCode = String(r.user_code || "")
-        root.loginUri = String(r.verification_uri || "https://microsoft.com/link")
+        root.loginUri = Model.safeLoginUri(r.verification_uri)
         root.loginExpiresAt = Date.now() + parseInt(r.expires_in || 900, 10) * 1000
         root.loginPollIntervalSec = Math.max(2, parseInt(r.interval || 5, 10))
         root.signingIn = true

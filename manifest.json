@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "anishkn.mstodo",
   "name": "MS To Do",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "author": "anishkn",
   "license": "MIT",
   "description": "Microsoft To Do tasks in your bar — quick-add with times and recurrence, keyboard-driven review, and desktop reminders so nothing slips",

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tests for the omarchy-mstodo CLI: grammar parsing and Graph payload mapping.
 
-Run:  python3 tests/test_tasks.py
+Run:  python3 tests/test_mstodo.py
 """
 
 import argparse
@@ -576,6 +576,217 @@ class Listing(unittest.TestCase):
         self.assertEqual(task["due"], 0)
         self.assertFalse(task["completed"])
         self.assertEqual(task["recurType"], "")
+
+
+class AuthRefreshMapping(unittest.TestCase):
+    """A refused token refresh is a sign-in state, not a generic API error."""
+
+    def setUp(self):
+        cli.set_authority("common")
+        self._orig_request = cli.oauth_token_request
+        self._orig_save = cli.save_json_atomic
+
+    def tearDown(self):
+        cli.oauth_token_request = self._orig_request
+        cli.save_json_atomic = self._orig_save
+
+    def _expired_tokens(self):
+        return {"refresh_token": "rt", "access_token": "at", "expires_at": 0}
+
+    def test_invalid_grant_maps_to_auth_required(self):
+        for err in ("invalid_grant", "interaction_required",
+                    "consent_required", "unauthorized_client"):
+            with self.subTest(err=err):
+                cli.oauth_token_request = lambda fields, e=err: (
+                    (_ for _ in ()).throw(cli.ApiError(f"{e}: token expired")))
+                with self.assertRaises(cli.AuthRequired):
+                    cli.access_token(self._expired_tokens())
+
+    def test_transient_api_error_stays_api_error(self):
+        cli.oauth_token_request = lambda fields: (
+            (_ for _ in ()).throw(cli.ApiError("temporarily_unavailable")))
+        with self.assertRaises(cli.ApiError) as ctx:
+            cli.access_token(self._expired_tokens())
+        self.assertNotIsInstance(ctx.exception, cli.AuthRequired)
+
+    def test_successful_refresh_saves_and_returns(self):
+        saved = {}
+        cli.save_json_atomic = lambda path, data: saved.update(path=path)
+        cli.oauth_token_request = lambda fields: {
+            "access_token": "fresh", "refresh_token": "rt2", "expires_in": 3600}
+        token = cli.access_token(self._expired_tokens())
+        self.assertEqual(token, "fresh")
+        self.assertIn("auth.json", str(saved.get("path")))
+
+
+class TaskPagination(unittest.TestCase):
+    """fetch_all_tasks walks @odata.nextLink but never off Graph v1.0."""
+
+    def setUp(self):
+        self.calls = []
+        self._orig_graph = cli.graph_request
+
+    def tearDown(self):
+        cli.graph_request = self._orig_graph
+
+    def _serve(self, pages):
+        """pages: dict mapping the request path (with query) to a payload."""
+        def fake(method, path, body=None, params=None):
+            self.calls.append(path)
+            if path in pages:
+                page = pages[path]
+                if isinstance(page, Exception):
+                    raise page
+                return page
+            raise AssertionError(f"unexpected request {path}")
+
+        cli.graph_request = fake
+
+    def test_follows_next_link(self):
+        base = "/me/todo/lists/L1/tasks?$top=250"
+        second = "/me/todo/lists/L1/tasks?$top=250&$skiptoken=abc"
+        self._serve({
+            base: {"value": [{"id": "a"}],
+                   "@odata.nextLink": f"https://graph.microsoft.com/v1.0{second}"},
+            second: {"value": [{"id": "b"}]},
+        })
+        tasks = cli.fetch_all_tasks("L1")
+        self.assertEqual([t["id"] for t in tasks], ["a", "b"])
+        self.assertEqual(len(self.calls), 2)
+
+    def test_rejects_offsite_next_link(self):
+        base = "/me/todo/lists/L1/tasks?$top=250"
+        self._serve({
+            base: {"value": [{"id": "a"}],
+                   "@odata.nextLink": "https://evil.example/steal?all=1"},
+        })
+        tasks = cli.fetch_all_tasks("L1")
+        self.assertEqual([t["id"] for t in tasks], ["a"])
+        self.assertEqual(len(self.calls), 1)
+
+    def test_rejects_non_https_or_wrong_path_next_link(self):
+        base = "/me/todo/lists/L1/tasks?$top=250"
+        for link in ("http://graph.microsoft.com/v1.0/x",
+                     "https://graph.microsoft.com/beta/x"):
+            with self.subTest(link=link):
+                self._serve({base: {"value": [], "@odata.nextLink": link}})
+                self.assertEqual(cli.fetch_all_tasks("L1"), [])
+                self.assertEqual(len(self.calls), 1)
+                self.calls.clear()
+
+    def test_caps_at_max_tasks_fetch(self):
+        base = "/me/todo/lists/L1/tasks?$top=250"
+        page = [{"id": i} for i in range(300)]
+        self._serve({base: {"value": page}})
+        tasks = cli.fetch_all_tasks("L1")
+        self.assertEqual(len(tasks), cli.MAX_TASKS_FETCH)
+
+    def test_encodes_list_id_in_first_url(self):
+        seen = []
+        cli.graph_request = lambda method, path, body=None, params=None: (
+            seen.append(path)) or {"value": []}
+        cli.fetch_all_tasks("../../me/lists")
+        prefix = "/me/todo/lists/"
+        self.assertTrue(seen[0].startswith(prefix))
+        # The id rides as ONE path segment — no raw separators inside it.
+        segment = seen[0][len(prefix):].split("/tasks", 1)[0]
+        self.assertNotIn("/", segment)
+        self.assertIn("%2F", segment)
+
+
+class MalformedResponses(unittest.TestCase):
+    """Garbage bodies surface as NetworkError, not tracebacks."""
+
+    class FakeCtx:
+        def __init__(self, payload):
+            self.resp = FakeResponse(payload)
+
+        def __enter__(self):
+            return self.resp
+
+        def __exit__(self, *exc):
+            return False
+
+    def tearDown(self):
+        if hasattr(self, "_orig_urlopen"):
+            cli.urllib.request.urlopen = self._orig_urlopen
+        if hasattr(self, "_orig_load_tokens"):
+            cli.load_tokens = self._orig_load_tokens
+
+    def _serve_body(self, payload):
+        self._orig_urlopen = cli.urllib.request.urlopen
+        cli.urllib.request.urlopen = lambda req, timeout=None: type(self).FakeCtx(payload)
+        # A live token so access_token() short-circuits and the request
+        # actually reaches urlopen.
+        self._orig_load_tokens = cli.load_tokens
+        cli.load_tokens = lambda: {
+            "access_token": "x", "refresh_token": "rt", "expires_at": time.time() + 9999}
+
+    def test_http_form_bad_json_is_network_error(self):
+        self._serve_body(b"\xff\xfe not json at all")
+        with self.assertRaises(cli.NetworkError):
+            cli.http_form("https://login.microsoftonline.com/token", {})
+
+    def test_graph_request_bad_json_is_network_error(self):
+        self._serve_body(b"<html>gateway error</html>")
+        with self.assertRaises(cli.NetworkError):
+            cli.graph_request("GET", "/me")
+
+    def test_graph_request_binary_junk_is_network_error(self):
+        self._serve_body(bytes(range(256)))
+        with self.assertRaises(cli.NetworkError):
+            cli.graph_request("GET", "/me")
+
+
+class LoginUriAllowlist(unittest.TestCase):
+    """The device-code URL is allowlisted to Microsoft sign-in hosts."""
+
+    def test_accepts_microsoft_hosts(self):
+        for uri in ("https://microsoft.com/devicelogin",
+                    "https://www.microsoft.com/link",
+                    "https://login.microsoftonline.com/common/oauth2/deviceauth"):
+            with self.subTest(uri=uri):
+                self.assertEqual(cli._login_uri({"verification_uri": uri}), uri)
+
+    def test_accepts_live_host(self):
+        uri = "https://login.live.com/oauth20_desktop.srf"
+        self.assertEqual(cli._login_uri({"verification_uri": uri}), uri)
+
+    def test_rejects_everything_else(self):
+        for uri in ("http://microsoft.com/link",
+                    "https://evil.example/microsoft.com",
+                    "javascript:alert(1)",
+                    "",
+                    None,
+                    "file:///etc/passwd"):
+            with self.subTest(uri=uri):
+                self.assertEqual(
+                    cli._login_uri({"verification_uri": uri}),
+                    "https://microsoft.com/link")
+
+    def test_missing_field_falls_back(self):
+        self.assertEqual(cli._login_uri({}), "https://microsoft.com/link")
+
+
+class MapTaskTimezones(unittest.TestCase):
+    """Uninterpreted zone strings are pinned to UTC, not local time."""
+
+    def test_unknown_tz_pinned_to_utc(self):
+        # 12:00 with an exotic zone must read as 12:00 UTC regardless of the
+        # machine's own timezone.
+        task = cli.map_task({
+            "dueDateTime": {"dateTime": "2026-08-22T12:00:00.0",
+                            "timeZone": "Florianopolis Standard Time"},
+        })
+        dt = datetime.fromtimestamp(task["due"], tz=timezone.utc)
+        self.assertEqual((dt.hour, dt.minute), (12, 0))
+
+    def test_utc_explicit_unchanged(self):
+        task = cli.map_task({
+            "dueDateTime": {"dateTime": "2026-08-22T12:00:00.0", "timeZone": "UTC"},
+        })
+        dt = datetime.fromtimestamp(task["due"], tz=timezone.utc)
+        self.assertEqual(dt.hour, 12)
 
 
 if __name__ == "__main__":

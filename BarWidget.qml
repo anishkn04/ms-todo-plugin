@@ -7,6 +7,10 @@ import "Model.js" as Model
 // Bar slot for MS To Do. The service owns the cache and the timers; this
 // reads already-shaped state off it so the line stays live whether or not
 // the panel has ever been opened.
+//
+// Left click opens the panel; right click walks three views: the next
+// commitment, how much is left today, or the icon alone. The chosen view
+// persists in this widget's shell.json entry, so it survives restarts.
 BarWidget {
   id: root
   moduleName: "anishkn.mstodo"
@@ -47,10 +51,49 @@ BarWidget {
   }
   readonly property bool hasLine: nextLine !== ""
 
+  // ---- display views ------------------------------------------------------
+  // Right click walks the ring; a live focus countdown outranks whichever
+  // view is active. The choice persists in this widget's shell.json entry
+  // ("displayMode") — same persistence as omarchy.clock's format ring and
+  // screen-time's iconOnly.
+  // nf-md-format_list_checks (U+F0316) as its UTF-16 surrogate pair — QML
+  // string \u escapes take exactly four hex digits, so five-digit codepoints
+  // cannot be written as one escape.
+  readonly property string glyph: "\uDB80\uDF16"
+
+  readonly property var modeRing: ["next", "count", "icon"]
+  readonly property string displayMode: {
+    var m = String(setting("displayMode", "next"))
+    return root.modeRing.indexOf(m) >= 0 ? m : "next"
+  }
+
+  function cycleMode() {
+    var next = root.modeRing[(root.modeRing.indexOf(root.displayMode) + 1) % root.modeRing.length]
+    if (next === root.displayMode) return
+    var entry = { id: root.moduleName }
+    for (var key in root.settings) if (key !== "id") entry[key] = root.settings[key]
+    entry.displayMode = next
+    // Applied locally first so the bar changes on the click itself; the
+    // shell.json write comes back through the bar as the same value.
+    root.settings = entry
+    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
+      root.bar.shell.updateEntryInline(root.moduleName, entry)
+  }
+
+  // Icon-only is a signed-in shape only — before sign-in the slot must keep
+  // saying "setup", and a running focus block owns the text in every view.
+  readonly property bool iconOnly: root.signedIn && !root.pomoActive && displayMode === "icon"
+
+  // What's left today: everything overdue plus everything due by midnight.
+  readonly property int remainingCount: overdueCount + dueTodayCount
+
   readonly property string displayText: !signedIn
     ? "setup"
-    : (pomoActive ? pomoClock : (hasLine ? nextLine : "clear"))
-  readonly property var verticalLines: [displayText]
+    : (pomoActive ? pomoClock
+      : iconOnly ? ""
+      : displayMode === "count" ? String(remainingCount)
+      : (hasLine ? nextLine : "clear"))
+  readonly property var verticalLines: [root.iconOnly ? root.glyph : displayText]
 
   function injectPanel() {
     var target = panelLoader.item
@@ -115,14 +158,17 @@ BarWidget {
     function toggle(): void { root.focusedInstance().togglePanel() }
     function focus(): void { if (root.service) root.service.togglePomo() }
     function focusStop(): void { if (root.service) root.service.stopPomo() }
+    function cycleMode(): void { root.cycleMode() }
   }
 
   WidgetButton {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.vertical ? "" : root.displayText
-    labelVisible: !root.vertical
+    // In icon mode the Text still holds the glyph so its advance width
+    // keeps the slot sized; labelVisible only stops the double render.
+    text: root.vertical ? "" : (root.iconOnly ? root.glyph : root.displayText)
+    labelVisible: !root.vertical && !root.iconOnly
     hasVisualContent: root.vertical ? root.verticalLines.length > 0 : text !== ""
     fixedHeight: root.vertical ? root.verticalLines.length * Style.bar.iconSlot : -1
 
@@ -147,7 +193,22 @@ BarWidget {
     }
 
     onPressed: function(b) {
-      root.togglePanel()
+      if (b === Qt.RightButton) root.cycleMode()
+      else root.togglePanel()
+    }
+
+    // Icon-only view: the hidden label still sizes the slot off its advance
+    // width; the glyph itself is painted through an OpticalGlyph so its ink
+    // is centred. Overdue work keeps recoloring it through the button's
+    // active state.
+    OpticalGlyph {
+      id: iconGlyph
+      visible: !root.vertical && root.iconOnly
+      anchors.fill: parent
+      text: root.glyph
+      fontFamily: button.fontFamily
+      fontSize: button.fontSize
+      color: button.active && button.useActiveColor ? button.activeColor : button.foreground
     }
 
     Column {

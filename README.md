@@ -112,6 +112,15 @@ All lengths are plugin settings (bar settings UI or `shell.json`):
 focus 25m, short break 5m, long break 15m, long break every 4 blocks by
 default, plus **auto-start next phase** and **notifications** toggles.
 
+## Bar views
+
+Left click always opens the panel. Right click cycles what the slot shows:
+the next commitment (`11:30 Work / Program #1`), how much is left today
+(overdue + due today), or just the plugin icon. The choice persists in your
+`shell.json`; `omarchy-mstodo cycle-mode` cycles it from scripts too. A
+running focus countdown outranks every view, and the `setup` hint before
+sign-in never hides.
+
 ## Keyboard
 
 | Key | Action |
@@ -188,7 +197,7 @@ The CLI is stdlib-only Python (no pip installs). Layout:
 ```
 ~/.config/omarchy/plugins/anishkn.mstodo/
 ├── manifest.json      plugin metadata + settings schema
-├── BarWidget.qml      bar slot: the next task line, or the countdown while one runs
+├── BarWidget.qml      bar slot: next task line / remaining count / icon (right-click cycles)
 ├── Panel.qml          popout: quick-add, Overdue/Today list, sign-in card,
 │                      undo window, help overlay (?), FOCUS timer block
 ├── Service.qml        mounted once: cache reader, sync timer, action queue,

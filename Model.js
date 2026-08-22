@@ -46,6 +46,17 @@ function plain(text) {
   return String(text || "").replace(/[<>&]/g, "")
 }
 
+// Mirror of the CLI's _login_uri allowlist: https on a Microsoft sign-in
+// host, else the known-good default. The CLI already filters before it
+// prints; this keeps a tampered cache or a future caller from handing the
+// browser something else.
+var LOGIN_URI_RE = /^https:\/\/(www\.)?microsoft\.com(\/|$)|^https:\/\/login\.(microsoftonline|live)\.com(\/|$)/
+
+function safeLoginUri(uri) {
+  var s = String(uri || "")
+  return LOGIN_URI_RE.test(s) ? s : "https://microsoft.com/link"
+}
+
 // ---- cache ---------------------------------------------------------------
 
 function parseJson(text) {
