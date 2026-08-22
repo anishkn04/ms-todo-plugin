@@ -5,10 +5,13 @@
 Bar display modes and hardening.
 
 - Right-click the bar slot to cycle views: next commitment → remaining
-  count (overdue + due today) → icon only. The choice persists in
+  count (overdue + due today, prefixed with the task glyph so it never
+  reads as a workspace number) → icon only. The choice persists in
   `shell.json` per widget; `omarchy-mstodo cycle-mode` works from scripts.
   A running focus countdown still outranks every view, and the setup hint
   never hides.
+- Panel rows keep their spacing between the repeat glyph and its label
+  (`↻ daily`, not `↻daily`).
 - A refused token refresh (revoked grant, password change, tenant policy)
   now flips the cache to signed-out instead of surfacing as a generic API
   error while the UI kept claiming a live session.

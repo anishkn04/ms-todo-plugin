@@ -116,7 +116,8 @@ default, plus **auto-start next phase** and **notifications** toggles.
 
 Left click always opens the panel. Right click cycles what the slot shows:
 the next commitment (`11:30 Work / Program #1`), how much is left today
-(overdue + due today), or just the plugin icon. The choice persists in your
+(overdue + due today, prefixed with the task glyph so it never reads as a
+workspace number), or just the plugin icon. The choice persists in your
 `shell.json`; `omarchy-mstodo cycle-mode` cycles it from scripts too. A
 running focus countdown outranks every view, and the `setup` hint before
 sign-in never hides.

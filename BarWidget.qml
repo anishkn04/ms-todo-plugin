@@ -85,13 +85,15 @@ BarWidget {
   readonly property bool iconOnly: root.signedIn && !root.pomoActive && displayMode === "icon"
 
   // What's left today: everything overdue plus everything due by midnight.
+  // The count view prefixes the plugin glyph — a bare number next to
+  // workspace indicators reads as "workspace 3", not as tasks.
   readonly property int remainingCount: overdueCount + dueTodayCount
 
   readonly property string displayText: !signedIn
     ? "setup"
     : (pomoActive ? pomoClock
       : iconOnly ? ""
-      : displayMode === "count" ? String(remainingCount)
+      : displayMode === "count" ? root.glyph + " " + remainingCount
       : (hasLine ? nextLine : "clear"))
   readonly property var verticalLines: [root.iconOnly ? root.glyph : displayText]
 

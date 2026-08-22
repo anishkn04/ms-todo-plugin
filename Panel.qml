@@ -239,7 +239,7 @@ Panel {
     var bits = []
     if (task.due > 0) bits.push(Model.dueLabel(Model.effectiveDue(task), Date.now()))
     var recur = Model.recurBadge(task)
-    if (recur !== "") bits.push(recur.replace("\u21bb ", "\u21bb"))
+    if (recur !== "") bits.push(recur)
     return bits.join(" ")
   }
 
