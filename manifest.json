@@ -1,0 +1,143 @@
+{
+  "schemaVersion": 1,
+  "id": "anishkn.mstodo",
+  "name": "MS To Do",
+  "version": "0.1.0",
+  "author": "anishkn",
+  "license": "MIT",
+  "description": "Microsoft To Do tasks in your bar — quick-add with times and recurrence, keyboard-driven review, and desktop reminders so nothing slips",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "MS To Do",
+    "description": "Due-today count, quick-add, recurring tasks, timed reminders, focus timer",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "syncInterval": "5 minutes",
+      "maxTasksPerSection": 8,
+      "undoSeconds": 6,
+      "notifyLeadMinutes": "At reminder time",
+      "listName": "",
+      "focusMinutes": 25,
+      "shortBreakMinutes": 5,
+      "longBreakMinutes": 15,
+      "longBreakInterval": 4,
+      "autoChain": true,
+      "pomoNotifications": true
+    },
+    "schema": [
+      {
+        "key": "syncInterval",
+        "type": "enum",
+        "label": "Background sync",
+        "description": "How often open tasks refresh on their own. Opening the panel always syncs; this governs the idle case. Every tick is a couple of Graph requests per monitor.",
+        "options": [
+          "2 minutes",
+          "5 minutes",
+          "15 minutes",
+          "1 hour",
+          "Only when opened"
+        ],
+        "defaultValue": "5 minutes"
+      },
+      {
+        "key": "maxTasksPerSection",
+        "type": "integer",
+        "label": "Max rows per section",
+        "description": "The panel scrolls past this; the cap keeps a bad week from becoming an endless popup.",
+        "min": 3,
+        "max": 30,
+        "step": 1,
+        "defaultValue": 8
+      },
+      {
+        "key": "undoSeconds",
+        "type": "integer",
+        "label": "Undo window (seconds)",
+        "description": "Completions and deletions are held this long before being sent. 0 sends immediately with no undo.",
+        "min": 0,
+        "max": 30,
+        "step": 1,
+        "defaultValue": 6
+      },
+      {
+        "key": "notifyLeadMinutes",
+        "type": "enum",
+        "label": "Desktop reminder lead",
+        "description": "Fire the desktop notification this many minutes before a task's reminder time. The phone is notified by the To Do app itself.",
+        "options": [
+          "At reminder time",
+          "5 minutes before",
+          "15 minutes before"
+        ],
+        "defaultValue": "At reminder time"
+      },
+      {
+        "key": "listName",
+        "type": "string",
+        "label": "List name",
+        "description": "Which To Do list to use. Empty uses your default list. Must match the display name exactly.",
+        "defaultValue": ""
+      },
+      {
+        "key": "focusMinutes",
+        "type": "integer",
+        "label": "Focus length (minutes)",
+        "min": 1,
+        "max": 180,
+        "step": 5,
+        "defaultValue": 25
+      },
+      {
+        "key": "shortBreakMinutes",
+        "type": "integer",
+        "label": "Short break (minutes)",
+        "min": 1,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 5
+      },
+      {
+        "key": "longBreakMinutes",
+        "type": "integer",
+        "label": "Long break (minutes)",
+        "min": 1,
+        "max": 120,
+        "step": 5,
+        "defaultValue": 15
+      },
+      {
+        "key": "longBreakInterval",
+        "type": "integer",
+        "label": "Long break every N blocks",
+        "min": 1,
+        "max": 12,
+        "step": 1,
+        "defaultValue": 4
+      },
+      {
+        "key": "autoChain",
+        "type": "boolean",
+        "label": "Auto-start next phase",
+        "description": "When a focus block or break ends, start the next phase on its own instead of waiting for you to press play.",
+        "defaultValue": true
+      },
+      {
+        "key": "pomoNotifications",
+        "type": "boolean",
+        "label": "Focus notifications",
+        "description": "Send a desktop toast when a focus block or break finishes.",
+        "defaultValue": true
+      }
+    ]
+  }
+}

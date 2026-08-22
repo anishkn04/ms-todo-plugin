@@ -1,0 +1,1203 @@
+#!/usr/bin/env python3
+"""Microsoft To Do client for the Omarchy shell plugin (anishkn.mstodo).
+
+Why a CLI and not XMLHttpRequest inside QML: the OAuth refresh token is a
+long-lived credential that belongs in a 0600 file rather than in the shell's
+process state, the device-code login needs a polling loop with backoff, and
+the quick-add grammar is ordinary string parsing that is miserable to unit
+test in QML and trivial in Python. The shell only ever runs this binary and
+parses JSON.
+
+Auth is Microsoft's public device-code flow against the v2 common endpoint.
+The default client id reuses Microsoft Azure PowerShell's first-party public
+client, which accepts delegated Graph scopes for personal accounts; if a
+tenant rejects it, register a free app (README) and put its id in
+OMARCHY_MSTODO_CLIENT_ID or auth.json's "client_id".
+
+All datetimes are sent as UTC instants ("timeZone": "UTC"); the cache stores
+epoch seconds so QML never parses ISO strings.
+
+Commands:
+  login                       authenticate via microsoft.com/link, then sync
+  login start [--json]        request a device code; print it as JSON
+  login poll [--json]         one poll against the pending sign-in
+  login cancel                drop a pending sign-in
+  logout                      forget tokens
+  sync [--max-age SEC]        refresh the on-disk cache (skipped when fresh)
+  status                      print the cache summary as JSON
+  list [SCOPE] [-a] [--json]  list cached tasks (overdue|today|upcoming|all|done)
+  add LINE                    create a task from the quick-add grammar
+  update TASK_ID LINE         rewrite an existing task from the grammar
+  complete TASK_ID            mark a task done (recurring -> next instance)
+  uncomplete TASK_ID          reopen a completed task
+  snooze TASK_ID WHEN         move due + reminder (@HH:MM, @tomorrow, ...)
+  delete TASK_ID              delete a task
+
+TASK_ID accepts the short id suffix shown by `list` when it is unique.
+
+Quick-add grammar (all parts optional, order free):
+  TITLE @today|@tomorrow|@mon..@sun|@DD|@DD.MM [HH:MM]
+        [repeat daily|weekdays|weekly|monthly|yearly|every N days|after-completion [until DD.MM]]
+        [!low|!normal|!high]
+
+Exit codes: 0 ok, 2 usage, 3 auth required, 4 network, 1 anything else.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import date, datetime, timedelta, timezone
+
+# --------------------------------------------------------------------------
+# constants
+
+GRAPH = "https://graph.microsoft.com/v1.0"
+AUTH_BASE = "https://login.microsoftonline.com/common/oauth2/v2.0"
+
+# Tenant authority for the current process. Most apps accept /common, but
+# apps registered for personal Microsoft accounts only reject it with
+# AADSTS9002346 and demand /consumers; login detects that and remembers the
+# choice in auth.json so refreshes hit the same tenant.
+_AUTHORITY = "common"
+
+
+def set_authority(authority: str) -> None:
+    global AUTH_BASE, _AUTHORITY
+    _AUTHORITY = authority if authority in ("common", "consumers") else "common"
+    AUTH_BASE = f"https://login.microsoftonline.com/{_AUTHORITY}/oauth2/v2.0"
+SCOPES = "Tasks.ReadWrite User.Read offline_access"
+
+# Registered public-client Azure app for this plugin (personal accounts).
+# Not a secret — client ids identify the app; override with
+# OMARCHY_MSTODO_CLIENT_ID or auth.json's "client_id" if you prefer your own.
+DEFAULT_CLIENT_ID = "1950a258-227b-4e31-a9cf-717495945fc2"  # TODO: replace with own app id
+
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+    "omarchy", "mstodo",
+)
+AUTH_PATH = os.path.join(STATE_DIR, "auth.json")
+CACHE_PATH = os.path.join(STATE_DIR, "data.json")
+CONFIG_PATH = os.path.join(STATE_DIR, "config.json")
+LOGIN_PATH = os.path.join(STATE_DIR, "login.json")
+
+
+def migrate_state_dir() -> None:
+    """Move the pre-rename ~/.local/state/omarchy/tasks tree (tokens, cache,
+    reminder bookkeeping) so an existing install keeps its session."""
+    legacy = os.path.join(
+        os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+        "omarchy", "tasks",
+    )
+    if os.path.isdir(legacy) and not os.path.exists(STATE_DIR):
+        try:
+            os.makedirs(os.path.dirname(STATE_DIR), exist_ok=True)
+            os.replace(legacy, STATE_DIR)
+        except OSError:
+            pass
+
+MAX_TASKS_FETCH = 250
+HTTP_TIMEOUT = 30
+
+
+class AuthRequired(Exception):
+    pass
+
+
+class NetworkError(Exception):
+    pass
+
+
+class ApiError(Exception):
+    pass
+
+
+# --------------------------------------------------------------------------
+# quick-add grammar
+
+WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+
+RECUR_PATTERNS = {
+    # key: (graph pattern type, interval, daysOfWeek)
+    "daily": ("daily", 1, None),
+    "weekdays": ("weekly", 1, ["monday", "tuesday", "wednesday", "thursday", "friday"]),
+    "weekly": ("weekly", 1, None),
+    "monthly": ("absoluteMonthly", 1, None),
+    "yearly": ("absoluteYearly", 1, None),
+    "after": ("regenerating", 1, None),
+}
+
+REPEAT_KEYWORDS = {
+    "daily": "daily", "every-day": "daily",
+    "weekdays": "weekdays", "workdays": "weekdays",
+    "weekly": "weekly", "every-week": "weekly",
+    "monthly": "monthly", "every-month": "monthly",
+    "yearly": "yearly", "annually": "yearly", "every-year": "yearly",
+    "after-completion": "after", "aftercompletion": "after",
+    "after": "after",
+}
+
+PRIORITIES = {"low": "low", "normal": "normal", "high": "high"}
+
+TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+DATE_DD_RE = re.compile(r"^(\d{1,2})$")
+DATE_DDMM_RE = re.compile(r"^(\d{1,2})\.(\d{1,2})$")
+
+
+def resolve_date_token(token: str, today: date):
+    """Map @word/@DD[.MM] to a concrete date, or None if not a date token."""
+    word = token[1:].lower() if token.startswith("@") else token.lower()
+    if word == "today":
+        return today
+    if word == "tomorrow":
+        return today + timedelta(days=1)
+    if word in WEEKDAYS:
+        delta = (WEEKDAYS[word] - today.weekday()) % 7
+        return today + timedelta(days=delta)
+    m = DATE_DD_RE.match(word)
+    if m:
+        return _roll_month(today, int(m.group(1)))
+    m = DATE_DDMM_RE.match(word)
+    if m:
+        day, month = int(m.group(1)), int(m.group(2))
+        for year in (today.year, today.year + 1):
+            try:
+                candidate = date(year, month, day)
+            except ValueError:
+                return False
+            if candidate >= today:
+                return candidate
+        return False
+    return None
+
+
+def _roll_month(today: date, day: int) -> date | None:
+    """Same day number in this or next month."""
+    year, month = today.year, today.month
+    for _ in range(13):
+        try:
+            candidate = date(year, month, day)
+        except ValueError:
+            pass
+        else:
+            if candidate >= today:
+                return candidate
+        month += 1
+        if month > 12:
+            month, year = 1, year + 1
+    return None
+
+
+def parse_quick_add(line: str, today: date | None = None):
+    """Split a quick-add line into structured parts.
+
+    Returns a dict with keys: title, due_date (date|None), time (tuple|None),
+    recur (key|None), every_n (int|None), recur_until (date|None),
+    priority (str|None).
+    Parse errors never block submission: unknown tokens stay in the title.
+    """
+    today = today or date.today()
+    title_parts: list[str] = []
+    due_date: date | None = None
+    time_part: tuple[int, int] | None = None
+    recur: str | None = None
+    every_n: int | None = None
+    recur_until: date | None = None
+    priority: str | None = None
+
+    def maybe_until(i: int) -> int:
+        """Consume 'until DATE' right after a recurrence keyword; return new i."""
+        nonlocal recur_until
+        if i + 1 < len(tokens) and tokens[i].lower() == "until":
+            resolved = resolve_date_token(tokens[i + 1], today)
+            if resolved:
+                recur_until = resolved
+                return i + 2
+        return i
+
+    tokens = line.split()
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+
+        if token.startswith("@") and len(token) > 1:
+            resolved = resolve_date_token(token, today)
+            if resolved is not None and resolved is not False:
+                due_date = resolved
+                i += 1
+                continue
+            # "@7:00" reads more naturally than "7:00" next to @dates.
+            tm = TIME_RE.match(token[1:])
+            if tm:
+                time_part = (int(tm.group(1)), int(tm.group(2)))
+                i += 1
+                continue
+
+        m = TIME_RE.match(token)
+        if m and not token.startswith("@"):
+            time_part = (int(m.group(1)), int(m.group(2)))
+            i += 1
+            continue
+
+        lowered = token.lower()
+        if lowered == "repeat" and i + 1 < len(tokens):
+            keyword = tokens[i + 1].lower()
+            if keyword == "every" and i + 3 < len(tokens) and tokens[i + 2].isdigit():
+                n = int(tokens[i + 2])
+                unit = tokens[i + 3].lower().rstrip("s")
+                if unit in ("day", "week", "month", "year"):
+                    every_n = n
+                    recur = f"every-{unit}"
+                    i = maybe_until(i + 4)
+                    continue
+            mapped = REPEAT_KEYWORDS.get(keyword)
+            if mapped:
+                recur = mapped
+                i = maybe_until(i + 2)
+                continue
+
+        if lowered.startswith("!") and lowered[1:] in PRIORITIES:
+            priority = PRIORITIES[lowered[1:]]
+            i += 1
+            continue
+
+        title_parts.append(token)
+        i += 1
+
+    return {
+        "title": " ".join(title_parts).strip(),
+        "due_date": due_date,
+        "time": time_part,
+        "recur": recur,
+        "every_n": every_n,
+        "recur_until": recur_until,
+        "priority": priority,
+    }
+
+
+def local_epoch(d: date, hhmm: tuple[int, int] | None, end_of_day: bool = False) -> float:
+    """Local wall-clock date (+ optional time) -> epoch seconds."""
+    if hhmm:
+        dt = datetime(d.year, d.month, d.day, hhmm[0], hhmm[1])
+    elif end_of_day:
+        dt = datetime(d.year, d.month, d.day, 23, 59)
+    else:
+        dt = datetime(d.year, d.month, d.day)
+    return dt.timestamp()
+
+
+def graph_datetime(epoch: float) -> dict:
+    dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+    return {
+        "dateTime": dt.strftime("%Y-%m-%dT%H:%M:%S.000"),
+        "timeZone": "UTC",
+    }
+
+
+def build_task_payload(parsed: dict) -> dict:
+    """Parsed quick-add -> Graph todoTask create/update body."""
+    body: dict = {"title": parsed["title"]}
+
+    # Graph refuses a recurrence without a dueDateTime (it anchors the
+    # pattern on it). "repeat daily" with no date therefore means "starting
+    # today" — or tomorrow when the stated time already passed.
+    if parsed["recur"] and not parsed["due_date"]:
+        t = parsed["time"] or (23, 59)
+        now = datetime.now()
+        base = now.date()
+        if (now.hour, now.minute) >= t:
+            base = base + timedelta(days=1)
+        parsed["due_date"] = base
+
+    if parsed["due_date"]:
+        due_epoch = local_epoch(parsed["due_date"], parsed["time"] or (23, 59))
+        body["dueDateTime"] = graph_datetime(due_epoch)
+        if parsed["time"]:
+            body["reminderDateTime"] = graph_datetime(due_epoch)
+            body["isReminderOn"] = True
+
+    recur_key = parsed["recur"]
+    interval_n = parsed["every_n"]
+    start_day = (parsed["due_date"] or date.today()).isoformat()
+    range_end = parsed.get("recur_until")
+
+    def recur_range() -> dict:
+        if range_end:
+            return {"type": "endDate", "startDate": start_day,
+                    "endDate": range_end.isoformat()}
+        return {"type": "noEnd", "startDate": start_day}
+
+    if recur_key == "after":
+        body["recurrence"] = {
+            "pattern": {"type": "regenerating", "interval": 1},
+            "range": recur_range(),
+        }
+    elif recur_key and recur_key.startswith("every-"):
+        unit = recur_key.split("-")[1]
+        types = {"day": "daily", "week": "weekly", "month": "absoluteMonthly", "year": "absoluteYearly"}
+        pattern_type = types[unit]
+        interval_map = {"daily": interval_n, "weekly": interval_n,
+                        "absoluteMonthly": interval_n, "absoluteYearly": interval_n}
+        body["recurrence"] = {
+            "pattern": {"type": pattern_type, "interval": interval_map[pattern_type]},
+            "range": recur_range(),
+        }
+    elif recur_key:
+        ptype, interval, days = RECUR_PATTERNS[recur_key]
+        pattern = {"type": ptype, "interval": interval}
+        if days:
+            pattern["daysOfWeek"] = days
+        body["recurrence"] = {
+            "pattern": pattern,
+            "range": recur_range(),
+        }
+
+    if parsed["priority"]:
+        body["importance"] = parsed["priority"]
+
+    return body
+
+
+def recur_label(parsed: dict) -> str:
+    if parsed["recur"] == "after":
+        label = "after completion"
+    elif parsed["recur"] and parsed["recur"].startswith("every-"):
+        n, unit = parsed["every_n"], parsed["recur"].split("-")[1]
+        label = f"every {n} {unit}" + ("s" if n != 1 else "")
+    else:
+        label = parsed["recur"] or ""
+    until = parsed.get("recur_until")
+    if label and until:
+        label += f" until {until.strftime('%d %b')}"
+    return label
+
+
+# --------------------------------------------------------------------------
+# token storage
+
+def load_json(path: str, fallback):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return fallback
+
+
+def save_json_atomic(path: str, data) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=1)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def client_id(tokens: dict) -> str:
+    return (
+        os.environ.get("OMARCHY_MSTODO_CLIENT_ID")
+        or tokens.get("client_id")
+        or DEFAULT_CLIENT_ID
+    )
+
+
+def load_tokens() -> dict:
+    return load_json(AUTH_PATH, {}) or {}
+
+
+def access_token(tokens: dict) -> str:
+    """Return a valid access token, refreshing when close to expiry."""
+    if not tokens.get("refresh_token"):
+        raise AuthRequired("not signed in — run 'omarchy-mstodo login'")
+    if tokens.get("access_token") and time.time() < tokens.get("expires_at", 0) - 120:
+        return tokens["access_token"]
+    set_authority(tokens.get("authority", "common"))
+    refreshed = oauth_token_request({
+        "client_id": client_id(tokens),
+        "grant_type": "refresh_token",
+        "refresh_token": tokens["refresh_token"],
+        "scope": SCOPES,
+    })
+    merged = {**tokens, **refreshed}
+    merged["expires_at"] = time.time() + refreshed.get("expires_in", 3600)
+    save_json_atomic(AUTH_PATH, merged)
+    return merged["access_token"]
+
+
+def http_form(url: str, fields: dict) -> dict:
+    data = urllib.parse.urlencode(fields).encode()
+    req = urllib.request.Request(url, data=data, headers={
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read().decode())
+        except ValueError:
+            payload = {}
+        error = payload.get("error", f"HTTP {exc.code}")
+        raise ApiError(f"{error}: {payload.get('error_description', '')[:300]}") from exc
+    except (urllib.error.URLError, OSError) as exc:
+        raise NetworkError(str(exc)) from exc
+
+
+def oauth_token_request(fields: dict) -> dict:
+    return http_form(f"{AUTH_BASE}/token", fields)
+
+
+# --------------------------------------------------------------------------
+# login / logout
+
+def _start_challenge(cid: str) -> dict:
+    """Request a device-code challenge, retrying under /consumers when the
+    app is registered for personal accounts only."""
+    try:
+        return http_form(f"{AUTH_BASE}/devicecode", {"client_id": cid, "scope": SCOPES})
+    except ApiError as exc:
+        if "AADSTS9002346" not in str(exc):
+            raise
+        set_authority("consumers")
+        return http_form(f"{AUTH_BASE}/devicecode", {"client_id": cid, "scope": SCOPES})
+
+
+def _register_hint(exc: Exception) -> None:
+    print(
+        f"Device-code request rejected ({exc}).\n\n"
+        "Register a free app instead:\n"
+        "  1. portal.azure.com -> App registrations -> New registration\n"
+        "  2. Accounts: personal Microsoft accounts only\n"
+        "  3. Authentication -> Allow public client flows: Yes\n"
+        "  4. Copy the Application (client) ID, then:\n"
+        "     OMARCHY_MSTODO_CLIENT_ID=<id> omarchy-mstodo login\n",
+        file=sys.stderr,
+    )
+
+
+def _save_pending(challenge: dict, cid: str) -> dict:
+    """Persist the challenge so `login poll` can run as its own process."""
+    pending = {
+        "device_code": challenge["device_code"],
+        "client_id": cid,
+        "authority": _AUTHORITY,
+        "interval": max(1, int(challenge.get("interval", 5))),
+        "expires_at": time.time() + int(challenge.get("expires_in", 900)),
+    }
+    save_json_atomic(LOGIN_PATH, pending)
+    return pending
+
+
+def _load_pending() -> dict:
+    return load_json(LOGIN_PATH, {}) or {}
+
+
+def _drop_pending() -> None:
+    try:
+        os.remove(LOGIN_PATH)
+    except FileNotFoundError:
+        pass
+
+
+def _poll_once(pending: dict) -> dict:
+    """One token request against the pending challenge -> status dict.
+
+    Definitive endings (success/expired/declined) clear the pending file;
+    transient errors leave it so a later poll can still succeed.
+    """
+    if not pending.get("device_code"):
+        return {"status": "none"}
+    if time.time() >= pending.get("expires_at", 0):
+        _drop_pending()
+        return {"status": "expired"}
+
+    set_authority(pending.get("authority", "common"))
+    try:
+        tokens = oauth_token_request({
+            "client_id": pending["client_id"],
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "device_code": pending["device_code"],
+        })
+    except ApiError as exc:
+        message = str(exc)
+        if message.startswith("authorization_pending"):
+            return {"status": "pending"}
+        if message.startswith("slow_down"):
+            return {"status": "slow_down"}
+        if message.startswith("authorization_declined"):
+            _drop_pending()
+            return {"status": "declined"}
+        if message.startswith("expired_token"):
+            _drop_pending()
+            return {"status": "expired"}
+        return {"status": "error", "message": message[:200]}
+    except NetworkError as exc:
+        return {"status": "error", "message": str(exc)[:200]}
+
+    tokens["client_id"] = pending["client_id"]
+    tokens["authority"] = pending.get("authority", "common")
+    tokens["expires_at"] = time.time() + tokens.get("expires_in", 3600)
+    save_json_atomic(AUTH_PATH, tokens)
+    _drop_pending()
+    return {"status": "success"}
+
+
+def cmd_login_start(args) -> int:
+    """Machine step 1: get a device code, persist it, print it as JSON."""
+    migrate_state_dir()
+    cid = os.environ.get("OMARCHY_MSTODO_CLIENT_ID") or DEFAULT_CLIENT_ID
+    try:
+        challenge = _start_challenge(cid)
+    except ApiError as exc:
+        _register_hint(exc)
+        print(json.dumps({"status": "error", "message": str(exc)[:200]}))
+        return 1
+    except NetworkError as exc:
+        print(json.dumps({"status": "error", "message": str(exc)[:200]}))
+        return 4
+    pending = _save_pending(challenge, cid)
+    print(json.dumps({
+        "status": "started",
+        "verification_uri": challenge.get("verification_uri", "https://microsoft.com/link"),
+        "user_code": challenge["user_code"],
+        "interval": pending["interval"],
+        "expires_in": int(challenge.get("expires_in", 900)),
+    }))
+    return 0
+
+
+def cmd_login_poll(args) -> int:
+    """Machine step 2: one poll; prints exactly one JSON status object."""
+    migrate_state_dir()
+    result = _poll_once(_load_pending())
+    if result["status"] == "success":
+        # Best effort: land the first cache immediately so the bar flips out
+        # of its setup state without waiting for the next timer tick.
+        cmd_sync(argparse.Namespace(max_age=None))
+    print(json.dumps(result))
+    return 0
+
+
+def cmd_login_cancel(args) -> int:
+    migrate_state_dir()
+    _drop_pending()
+    print(json.dumps({"status": "cancelled"}))
+    return 0
+
+
+def cmd_login(args) -> int:
+    step = getattr(args, "step", None)
+    if step == "start":
+        return cmd_login_start(args)
+    if step == "poll":
+        return cmd_login_poll(args)
+    if step == "cancel":
+        return cmd_login_cancel(args)
+    return _login_interactive(args)
+
+
+def _login_interactive(_args) -> int:
+    """Human flow in one process: prints the code, polls until done."""
+    migrate_state_dir()
+    cid = os.environ.get("OMARCHY_MSTODO_CLIENT_ID") or DEFAULT_CLIENT_ID
+    try:
+        challenge = _start_challenge(cid)
+    except ApiError as exc:
+        _register_hint(exc)
+        return 1
+    except NetworkError as exc:
+        print(f"Network error: {exc}", file=sys.stderr)
+        return 4
+
+    print(f"Open {challenge['verification_uri']} and enter code: {challenge['user_code']}",
+          file=sys.stderr)
+    print("Waiting for approval...", file=sys.stderr)
+
+    pending = {
+        "device_code": challenge["device_code"],
+        "client_id": cid,
+        "authority": _AUTHORITY,
+        "interval": max(1, int(challenge.get("interval", 5))),
+        "expires_at": time.time() + int(challenge.get("expires_in", 900)),
+    }
+    interval = pending["interval"]
+    slow_down = 0
+    while True:
+        time.sleep(interval + slow_down)
+        result = _poll_once(pending)
+        status = result["status"]
+        if status == "success":
+            break
+        if status == "slow_down":
+            slow_down += 5
+            continue
+        if status == "expired":
+            print("Login window expired, run login again.", file=sys.stderr)
+            return 1
+        if status == "declined":
+            print("Sign-in declined.", file=sys.stderr)
+            return 1
+        if status == "error":
+            print(f"Login failed: {result.get('message', '')}", file=sys.stderr)
+            return 1
+
+    print("Signed in.", file=sys.stderr)
+    return cmd_sync(argparse.Namespace(max_age=None))
+
+
+def cmd_logout(_args) -> int:
+    migrate_state_dir()
+    for path in (AUTH_PATH, LOGIN_PATH):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+    print("Tokens removed.", file=sys.stderr)
+    return 0
+
+
+# --------------------------------------------------------------------------
+# graph client
+
+def graph_request(method: str, path: str, body: dict | None = None, params: dict | None = None) -> dict:
+    tokens = load_tokens()
+    url = GRAPH + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "Authorization": f"Bearer {access_token(tokens)}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            raw = resp.read().decode()
+            return json.loads(raw) if raw.strip() else {}
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read().decode())
+        except ValueError:
+            payload = {}
+        message = payload.get("error", {}).get("message", f"HTTP {exc.code}")
+        if exc.code in (401, 403):
+            # A refresh already happened inside access_token(); a second 401
+            # means the session itself is dead (password change, revoked
+            # grant, tenant policy). Surface it as sign-in state.
+            raise AuthRequired(message[:300]) from exc
+        if exc.code == 404:
+            raise ApiError(f"not found: {path}") from exc
+        if exc.code == 429:
+            retry_after = exc.headers.get("Retry-After", "10")
+            raise ApiError(f"rate limited, retry after {retry_after}s") from exc
+        raise ApiError(message[:300]) from exc
+    except (urllib.error.URLError, OSError) as exc:
+        raise NetworkError(str(exc)) from exc
+
+
+def pick_list(config: dict) -> dict:
+    lists = graph_request("GET", "/me/todo/lists", params={"$top": 100}).get("value", [])
+    if not lists:
+        raise ApiError("no task lists on this account")
+    wanted = config.get("listName")
+    if wanted:
+        for entry in lists:
+            if entry.get("displayName") == wanted:
+                return entry
+    for entry in lists:
+        if entry.get("wellknownListName") == "defaultList":
+            return entry
+    return lists[0]
+
+
+def map_task(raw: dict) -> dict:
+    def epoch_of(dt_field):
+        if not isinstance(dt_field, dict):
+            return 0
+        try:
+            iso = dt_field.get("dateTime") or ""
+            tz = dt_field.get("timeZone", "UTC")
+            dt = datetime.fromisoformat(iso)
+            if tz.upper() == "UTC":
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except (ValueError, AttributeError):
+            return 0
+
+    recurrence = raw.get("recurrence") or {}
+    pattern = recurrence.get("pattern") or {}
+    return {
+        "id": raw.get("id", ""),
+        "title": raw.get("title", ""),
+        "due": epoch_of(raw.get("dueDateTime")),
+        "remind": epoch_of(raw.get("reminderDateTime")) if raw.get("isReminderOn") else 0,
+        "isReminderOn": bool(raw.get("isReminderOn")),
+        "importance": raw.get("importance", "normal"),
+        "completed": raw.get("status") == "completed",
+        "completedAt": epoch_of(raw.get("completedDateTime")),
+        "updatedAt": epoch_of({"dateTime": raw.get("lastModifiedDateTime"), "timeZone": "UTC"}),
+        "recurType": pattern.get("type", ""),
+        "recurInterval": pattern.get("interval", 1),
+        "recurDays": ",".join(pattern.get("daysOfWeek") or []),
+    }
+
+
+# --------------------------------------------------------------------------
+# sync / status
+
+def write_cache(**fields) -> None:
+    cache = load_json(CACHE_PATH, {}) or {}
+    cache.update(fields)
+    save_json_atomic(CACHE_PATH, cache)
+
+
+def read_config() -> dict:
+    config = load_json(CONFIG_PATH, {}) or {}
+    if os.environ.get("OMARCHY_MSTODO_LIST"):
+        config["listName"] = os.environ["OMARCHY_MSTODO_LIST"]
+    return config
+
+
+def cmd_sync(args) -> int:
+    config = read_config()
+    now = time.time()
+
+    if args.max_age:
+        cached = load_json(CACHE_PATH, {}) or {}
+        fresh_at = cached.get("syncedAt", 0)
+        if now - fresh_at < args.max_age and not cached.get("authRequired"):
+            return 0
+
+    try:
+        chosen = pick_list(config)
+    except AuthRequired:
+        write_cache(syncedAt=now, authRequired=True)
+        print("Session expired — run 'omarchy-mstodo login'", file=sys.stderr)
+        return 3
+    except NetworkError as exc:
+        print(f"Network error during sync: {exc}", file=sys.stderr)
+        return 4
+    except ApiError as exc:
+        print(f"To Do API error: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        me = graph_request("GET", "/me").get("userPrincipalName", "")
+        tasks_raw = graph_request(
+            "GET", f"/me/todo/lists/{chosen['id']}/tasks", params={"$top": MAX_TASKS_FETCH},
+        ).get("value", [])
+    except AuthRequired:
+        write_cache(syncedAt=now, authRequired=True)
+        print("Session expired — run 'omarchy-mstodo login'", file=sys.stderr)
+        return 3
+    except NetworkError as exc:
+        print(f"Network error during sync: {exc}", file=sys.stderr)
+        return 4
+    except ApiError as exc:
+        print(f"To Do API error: {exc}", file=sys.stderr)
+        return 1
+
+    write_cache(
+        syncedAt=now,
+        authRequired=False,
+        account=me,
+        listId=chosen.get("id", ""),
+        listName=chosen.get("displayName", ""),
+        tasks=[map_task(t) for t in tasks_raw],
+    )
+    return 0
+
+
+def cmd_status(_args) -> int:
+    cache = load_json(CACHE_PATH, {}) or {}
+    print(json.dumps(cache))
+    return 0
+
+
+# --------------------------------------------------------------------------
+# listing
+
+def eff_epoch(task: dict) -> float:
+    """Mirror of Model.js effectiveDue: MS To Do truncates due to date-only
+    (midnight UTC); the wall-clock time lives on the reminder."""
+    due = task.get("due") or 0
+    remind = task.get("remind") or 0
+    if task.get("isReminderOn") and remind > 0 and due > 0:
+        if date.fromtimestamp(due) == date.fromtimestamp(remind):
+            return remind
+    return due
+
+
+def recur_badge(task: dict) -> str:
+    rtype = task.get("recurType") or ""
+    if not rtype:
+        return ""
+    interval = task.get("recurInterval") or 1
+    days = task.get("recurDays") or ""
+    if rtype == "regenerating":
+        return "\u21bb after"
+    if days:
+        shorts = ",".join(d[:3] for d in days.split(","))
+        return f"\u21bb weekdays" if shorts == "mon,tue,wed,thu,fri" else f"\u21bb {shorts}"
+    names = {
+        "daily": "\u21bb daily", "weekly": "\u21bb weekly",
+        "absoluteMonthly": "\u21bb monthly", "absoluteYearly": "\u21bb yearly",
+    }
+    base = names.get(rtype, f"\u21bb {rtype}")
+    if interval != 1:
+        base += f" x{interval}"
+    return base
+
+
+def when_label(epoch: float) -> str:
+    """"HH:MM" today, "Fri 28 Aug 09:30" otherwise; bare day for date-only."""
+    lt = time.localtime(epoch)
+    now = time.localtime()
+    same_day = lt.tm_year == now.tm_year and lt.tm_yday == now.tm_yday
+    hm = time.strftime("%H:%M", lt)
+    has_time = lt.tm_hour != 0 or lt.tm_min != 0
+    if same_day:
+        return hm if has_time else "today"
+    day = time.strftime("%a %d %b", lt)
+    return f"{day} {hm}" if has_time else day
+
+
+def short_id(task_id: str) -> str:
+    return task_id.replace("=", "")[-7:]
+
+
+def format_task_line(task: dict) -> str:
+    """One aligned row: priority, when, title, recurrence, id suffix."""
+    mark = "!" if task.get("importance") == "high" else " "
+    done = bool(task.get("completed"))
+    epoch = eff_epoch(task)
+    when = "\u2713 done" if done else (when_label(epoch) if epoch else "no date")
+    badge = recur_badge(task)
+    return (f"{mark} {when:<16} {task.get('title', ''):<42}"
+            f"{badge:<12} {short_id(task.get('id', ''))}".rstrip())
+
+
+def select_groups(tasks: list[dict], include_done: bool) -> list[tuple[str, list[dict]]]:
+    """Open tasks bucketed Overdue/Today/Later (+ Done when requested)."""
+    now = time.time()
+    lt = time.localtime(now)
+    today_start = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+    today_end = today_start + 86400
+    groups: dict[str, list[dict]] = {"Overdue": [], "Today": [], "Later": [], "Done": []}
+    for t in tasks:
+        if t.get("completed"):
+            if include_done:
+                groups["Done"].append(t)
+            continue
+        due = t.get("due") or 0
+        if due <= 0:
+            groups["Later"].append(t)
+        elif due < today_start:
+            groups["Overdue"].append(t)
+        elif due < today_end:
+            groups["Today"].append(t)
+        else:
+            groups["Later"].append(t)
+
+    def sort_key(t: dict):
+        e = eff_epoch(t) or float("inf")
+        rank = {"high": 0, "normal": 1, "low": 2}
+        return (e, rank.get(t.get("importance"), 1), t.get("title", ""))
+
+    for g in groups.values():
+        g.sort(key=sort_key)
+    out = [(name, groups[name]) for name in ("Overdue", "Today", "Later")]
+    if include_done:
+        out.append(("Done", groups["Done"]))
+    return out
+
+
+def cmd_list(args) -> int:
+    cache = load_json(CACHE_PATH, {}) or {}
+    tasks = cache.get("tasks", [])
+    scope = getattr(args, "scope", None) or ""
+    show_done = bool(args.all_done) or scope == "all" or scope == "done"
+
+    if args.json:
+        if scope in ("overdue", "today", "upcoming", "done"):
+            wanted = {"overdue": "Overdue", "today": "Today",
+                      "upcoming": "Later", "done": "Done"}[scope]
+            payload = {wanted.lower(): [t for n, ts in select_groups(tasks, True)
+                                        for t in ts if n == wanted]}
+        elif scope == "all":
+            payload = {n.lower(): ts for n, ts in select_groups(tasks, True)}
+        else:
+            payload = {n.lower(): ts for n, ts in select_groups(tasks, False)}
+        print(json.dumps(payload, indent=1))
+        return 0
+
+    if not tasks:
+        print("No cached tasks — run 'omarchy-mstodo sync'.")
+        return 0
+
+    lines: list[str] = []
+    for name, group in select_groups(tasks, show_done):
+        if scope == "overdue" and name != "Overdue":
+            continue
+        if scope == "today" and name not in ("Overdue", "Today"):
+            continue
+        if scope == "upcoming" and name != "Later":
+            continue
+        if scope == "done" and name != "Done":
+            continue
+        if scope == "all" and name == "Done" and not group:
+            continue
+        if not group and scope not in ("all", "done"):
+            continue
+        lines.append(f"{name} ({len(group)})")
+        lines.extend(f"  {format_task_line(t)}" for t in group)
+        lines.append("")
+    print("\n".join(lines).rstrip())
+    return 0
+
+
+# --------------------------------------------------------------------------
+# mutations
+
+def require_task_id(task_id: str) -> str:
+    if not task_id:
+        raise SystemExitWith(2, "missing TASK_ID")
+    return task_id
+
+
+def resolve_task_id(token: str, cache: dict) -> str:
+    """Accept a full Graph id or a unique id suffix (as printed by `list`)."""
+    tasks = cache.get("tasks", [])
+    for t in tasks:
+        if t.get("id") == token:
+            return token
+    key = token.replace("=", "")
+    if len(key) < 4:
+        raise SystemExitWith(2, f"id '{token}' too short — need 4+ characters")
+    hits = [t["id"] for t in tasks if t.get("id", "").replace("=", "").endswith(key)]
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        raise SystemExitWith(2, f"ambiguous id '{token}' — {len(hits)} tasks share that suffix")
+    raise SystemExitWith(2, f"no cached task matches '{token}' — run 'omarchy-mstodo list'")
+
+
+def full_task_id(token: str) -> str:
+    require_task_id(token)
+    return resolve_task_id(token, load_json(CACHE_PATH, {}) or {})
+
+
+class SystemExitWith(Exception):
+    def __init__(self, code: int, message: str):
+        self.code = code
+        self.message = message
+
+
+def mutate(method: str, task_id: str, body: dict | None = None) -> int:
+    cache = load_json(CACHE_PATH, {}) or {}
+    list_id = cache.get("listId")
+    if not list_id:
+        print("No cached list yet — run 'omarchy-mstodo sync' once.", file=sys.stderr)
+        return 1
+    path = f"/me/todo/lists/{list_id}/tasks/{task_id}"
+    try:
+        if method == "DELETE":
+            graph_request("DELETE", path)
+        else:
+            graph_request("PATCH", path, body=body)
+    except AuthRequired:
+        write_cache(syncedAt=time.time(), authRequired=True)
+        print("Session expired — run 'omarchy-mstodo login'", file=sys.stderr)
+        return 3
+    except NetworkError as exc:
+        print(f"Network error: {exc}", file=sys.stderr)
+        return 4
+    except ApiError as exc:
+        print(f"To Do API error: {exc}", file=sys.stderr)
+        return 1
+    # The next timer sync picks up server state (including recurring tasks'
+    # newly materialised instances); nothing optimistic to do here.
+    return 0
+
+
+def cmd_complete(args) -> int:
+    return mutate("PATCH", full_task_id(args.task_id), {"status": "completed"})
+
+
+def cmd_uncomplete(args) -> int:
+    return mutate("PATCH", full_task_id(args.task_id), {"status": "notStarted"})
+
+
+def cmd_delete(args) -> int:
+    return mutate("DELETE", full_task_id(args.task_id))
+
+
+RELATIVE_RE = re.compile(r"^\+(\d+)([mhd])$")
+
+
+def parse_relative(token: str) -> float | None:
+    """'+90m'/'+2h'/'+1d' -> seconds offset."""
+    m = RELATIVE_RE.match(token)
+    if not m:
+        return None
+    n, unit = int(m.group(1)), m.group(2)
+    return n * {"m": 60, "h": 3600, "d": 86400}[unit]
+
+
+def cmd_snooze(args) -> int:
+    snooze_id = full_task_id(args.task_id)
+    today = date.today()
+    tokens = args.when.split()
+    target_date: date | None = None
+    time_part = (9, 0)
+    relative_offset: float | None = None
+
+    for token in tokens:
+        resolved = resolve_date_token(token, today)
+        if resolved is not None and resolved is not False:
+            target_date = resolved
+        elif TIME_RE.match(token):
+            m = TIME_RE.match(token)
+            time_part = (int(m.group(1)), int(m.group(2)))
+        else:
+            offset = parse_relative(token)
+            if offset is None:
+                print(f"snooze: cannot parse '{token}'", file=sys.stderr)
+                return 2
+            relative_offset = offset
+    if target_date is None:
+        target_date = today
+
+    epoch = local_epoch(target_date, time_part)
+    if relative_offset is not None:
+        epoch = time.time() + relative_offset
+
+    body = {
+        "dueDateTime": graph_datetime(epoch),
+        "reminderDateTime": graph_datetime(epoch),
+        "isReminderOn": True,
+    }
+    return mutate("PATCH", snooze_id, body)
+
+
+def cmd_add(args) -> int:
+    return _create_or_update(None, args.line)
+
+
+def cmd_update(args) -> int:
+    return _create_or_update(full_task_id(args.task_id), args.line)
+
+
+def _create_or_update(task_id: str | None, line: str) -> int:
+    parsed = parse_quick_add(line)
+    if not parsed["title"]:
+        print("Nothing to add — no title found.", file=sys.stderr)
+        return 2
+
+    cache = load_json(CACHE_PATH, {}) or {}
+    list_id = cache.get("listId")
+    if not list_id:
+        print("No cached list yet — run 'omarchy-mstodo sync' first.", file=sys.stderr)
+        return 1
+
+    body = build_task_payload(parsed)
+    label = recur_label(parsed)
+    try:
+        if task_id:
+            graph_request("PATCH", f"/me/todo/lists/{list_id}/tasks/{task_id}", body=body)
+        else:
+            created = graph_request(
+                "POST", f"/me/todo/lists/{list_id}/tasks", body=body,
+            )
+            print(json.dumps({
+                "id": created.get("id", ""),
+                "title": created.get("title", ""),
+                "recur": label,
+            }))
+    except AuthRequired:
+        write_cache(syncedAt=time.time(), authRequired=True)
+        print("Session expired — run 'omarchy-mstodo login'", file=sys.stderr)
+        return 3
+    except NetworkError as exc:
+        print(f"Network error: {exc}", file=sys.stderr)
+        return 4
+    except ApiError as exc:
+        print(f"To Do API error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+# --------------------------------------------------------------------------
+# argument parsing
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="omarchy-mstodo", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command")
+
+    p_login = sub.add_parser("login", help="authenticate via microsoft.com/link")
+    p_login.add_argument("step", nargs="?", choices=["start", "poll", "cancel"], default=None,
+                         help="machine steps: start prints the code as JSON, poll checks once, cancel aborts")
+    sub.add_parser("logout", help="forget stored tokens")
+
+    p_sync = sub.add_parser("sync", help="refresh the on-disk cache")
+    p_sync.add_argument("--max-age", type=float, default=None, metavar="SEC",
+                        help="skip network when the cache is younger than SEC seconds")
+
+    sub.add_parser("status", help="print the cache summary as JSON")
+
+    p_list = sub.add_parser("list", help="list tasks from the cache")
+    p_list.add_argument("scope", nargs="?", default="",
+                        choices=["", "overdue", "today", "upcoming", "all", "done"],
+                        help="filter (default: open tasks grouped)")
+    p_list.add_argument("-a", "--all-done", action="store_true",
+                        help="include completed tasks")
+    p_list.add_argument("--json", action="store_true", help="machine-readable output")
+
+    p_add = sub.add_parser("add", help="create a task from the quick-add grammar")
+    p_add.add_argument("line")
+
+    p_update = sub.add_parser("update", help="rewrite an existing task from the grammar")
+    p_update.add_argument("task_id")
+    p_update.add_argument("line")
+
+    for name, fn, help_text in (
+        ("complete", cmd_complete, "mark a task done"),
+        ("uncomplete", cmd_uncomplete, "reopen a completed task"),
+        ("delete", cmd_delete, "delete a task"),
+    ):
+        p = sub.add_parser(name, help=help_text)
+        p.add_argument("task_id")
+
+    p_snooze = sub.add_parser("snooze", help="move due + reminder of a task")
+    p_snooze.add_argument("task_id")
+    p_snooze.add_argument("when", nargs="+", metavar="@WHEN")
+
+    args = parser.parse_args(argv)
+    handlers = {
+        "login": cmd_login, "logout": cmd_logout, "sync": cmd_sync, "status": cmd_status,
+        "list": cmd_list,
+        "add": cmd_add, "update": cmd_update, "complete": cmd_complete,
+        "uncomplete": cmd_uncomplete, "delete": cmd_delete, "snooze": cmd_snooze,
+    }
+    if args.command not in handlers:
+        parser.print_help()
+        return 2
+    try:
+        migrate_state_dir()
+        return handlers[args.command](args)
+    except SystemExitWith as exc:
+        print(exc.message, file=sys.stderr)
+        return exc.code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
