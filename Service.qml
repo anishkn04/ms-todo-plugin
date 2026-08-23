@@ -10,12 +10,14 @@ import "Model.js" as Model
 // live here.
 //
 // State model mirrors the ticktick plugin's, minus what To Do does not need:
-//   - data.json is the cache the CLI writes and this reads via FileView.
+//   - data.json is the cache the CLI writes and this reads back through a
+//     bounded reader (`timeout 5 head -c`), never whole-file into the shell.
 //     Optimistic UI (pending completions/deletions) clears when the write
 //     lands, because the write is the authority on what is still open.
 //   - Writes go through a single Process with a FIFO of argv vectors; Graph
 //     mutations are cheap but serialising them avoids interleaved tokens
-//     refreshes and keeps error reporting in one place.
+//     refreshes and keeps error reporting in one place. CLI output is capped
+//     at the producer (head -c) before it can reach a collector.
 //   - Reminders: the phone is notified by Microsoft's own app. This side
 //     watches the cache with a minute clock and fires notify-send when a
 //     task's reminder time arrives (minus the configured lead). A notified
@@ -66,32 +68,103 @@ Item {
     root.sections = Model.sectionize(root.cache.tasks, Date.now())
   }
 
-  property FileView dataFile: FileView {
+  // ---- state files ---------------------------------------------------------
+  //
+  // Nothing under ~/.local/state is trusted to be small: data.json mirrors
+  // remote Graph state, and every other file sits user-writable. Reads are
+  // therefore capped at the producer instead of after accumulation — head
+  // -c stops consuming at the limit, so the collector can never hold more
+  // than that, and timeout keeps a swapped-in FIFO from stalling the
+  // process. The FileView objects below are watchers and writers only;
+  // preload:false means Quickshell never materializes a file into this
+  // process. Model.js parse-time caps stay as the second line of defense.
+
+  readonly property int dataReadLimit: 262144   // 256 KiB of task cache
+  readonly property int authReadLimit: 16384    // token blobs are tiny
+  readonly property int stateReadLimit: 4096    // notified/pomo maps
+
+  function boundedRead(path, limit) {
+    return ["timeout", "5", "head", "-c", String(limit), "--", path]
+  }
+
+  FileView {
+    id: dataWatch
     path: root.statePath + "/data.json"
     watchChanges: true
+    preload: false
     printErrors: false
-    onFileChanged: reload()
-    onLoaded: {
-      root.cache = Model.parseCache(text())
-      root.reloadSections()
-      // The write that lands here is the authority on what is still open;
-      // optimistic rows stop being needed the moment it arrives.
-      root.pendingIds = ({})
-      root.pendingDeletes = ({})
+    onFileChanged: root.readData()
+  }
+
+  // One read in flight; a change arriving mid-read queues exactly one
+  // follow-up, so a burst of writes can never starve the latest one out.
+  property bool dataReadQueued: false
+
+  function readData() {
+    if (dataReadProc.running) {
+      root.dataReadQueued = true
+      return
     }
-    onLoadFailed: {
-      root.cache = Model.parseCache("")
-      root.reloadSections()
+    root.dataReadQueued = false
+    dataReadProc.command = root.boundedRead(root.statePath + "/data.json", root.dataReadLimit)
+    dataReadProc.running = true
+  }
+
+  function applyData(raw) {
+    // A prefix cut off mid-document parses as garbage and lands on the
+    // empty-cache path, same as any other unreadable file; the next sync
+    // rewrite brings the UI back through this same reader.
+    root.cache = Model.parseCache(raw)
+    root.reloadSections()
+    // The write that lands here is the authority on what is still open;
+    // optimistic rows stop being needed the moment it arrives.
+    root.pendingIds = ({})
+    root.pendingDeletes = ({})
+  }
+
+  Process {
+    id: dataReadProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyData(String(text || ""))
+    }
+    onExited: {
+      if (root.dataReadQueued) root.readData()
     }
   }
 
   FileView {
-    id: authProbe
+    id: authWatch
     path: root.statePath + "/auth.json"
     watchChanges: true
+    preload: false
     printErrors: false
-    onLoaded: root.hasTokens = true
-    onLoadFailed: root.hasTokens = false
+    onFileChanged: root.readAuth()
+  }
+
+  property bool authReadQueued: false
+
+  function readAuth() {
+    if (authReadProc.running) {
+      root.authReadQueued = true
+      return
+    }
+    root.authReadQueued = false
+    authReadProc.command = root.boundedRead(root.statePath + "/auth.json", root.authReadLimit)
+    authReadProc.running = true
+  }
+
+  Process {
+    id: authReadProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      // Empty text covers both "missing file" and "empty file": either way
+      // there are no tokens to point at.
+      onStreamFinished: root.hasTokens = String(text || "").trim() !== ""
+    }
+    onExited: {
+      if (root.authReadQueued) root.readAuth()
+    }
   }
 
   SystemClock {
@@ -136,18 +209,34 @@ Item {
   property string actionError: ""
   readonly property bool syncing: syncProc.running
 
+  // CLI output is consumed only where a human reads it: an error line or a
+  // sign-in status object, both short by design. The wrapper caps what can
+  // reach a collector at the producer — head stops reading after capBytes
+  // and SIGPIPE ends a runaway child — while pipefail preserves the CLI's
+  // exit code. The "stderr" capture also forwards stdout (which is empty
+  // for our sync/action paths) so it, too, is bounded.
+  function cappedCmd(args, capBytes, capture) {
+    var redirect = capture === "stdout"
+      ? "2>/dev/null | head -c " + capBytes
+      : "2>&1 | head -c " + capBytes
+    return ["sh", "-c", 'set -o pipefail; "$0" "$@" ' + redirect, root.cli].concat(args)
+  }
+
+  readonly property int errCapBytes: 8192     // an error message, generously
+  readonly property int jsonCapBytes: 16384   // login status objects
+
   function refresh(force) {
     if (!root.signedIn) return
     if (syncProc.running) return
-    syncProc.command = force === false
-      ? [root.cli, "sync", "--max-age", String(Math.max(30, refreshIntervalSec - 15))]
-      : [root.cli, "sync"]
+    var args = force === false
+      ? ["sync", "--max-age", String(Math.max(30, refreshIntervalSec - 15))]
+      : ["sync"]
+    syncProc.command = root.cappedCmd(args, root.errCapBytes, "stderr")
     syncProc.running = true
   }
 
   Process {
     id: syncProc
-    command: [root.cli, "sync"]
     stderr: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -157,6 +246,10 @@ Item {
     }
     onExited: function(code) {
       if (code === 0) root.actionError = ""
+      // The CLI just rewrote data.json; reload through the bounded reader
+      // rather than trusting the watcher, which never attached if the state
+      // directory did not exist yet when this service started.
+      root.readData()
     }
   }
 
@@ -199,7 +292,7 @@ Item {
     root.loginCode = ""
     root.loginUri = ""
     root.loginSlowDowns = 0
-    loginStartProc.command = [root.cli, "login", "start"]
+    loginStartProc.command = root.cappedCmd(["login", "start"], root.jsonCapBytes, "stdout")
     loginStartProc.running = true
   }
 
@@ -236,7 +329,7 @@ Item {
       return
     }
     if (loginPollProc.running) return
-    loginPollProc.command = [root.cli, "login", "poll"]
+    loginPollProc.command = root.cappedCmd(["login", "poll"], root.jsonCapBytes, "stdout")
     loginPollProc.running = true
   }
 
@@ -260,7 +353,6 @@ Item {
         Qt.openUrlExternally(root.loginUri)
       }
     }
-    stderr: StdioCollector {}
   }
 
   Process {
@@ -289,7 +381,10 @@ Item {
         }
       }
     }
-    stderr: StdioCollector {}
+    onExited: {
+      // Approval writes auth.json; pick it up without waiting for the sync.
+      root.readAuth()
+    }
   }
 
   Timer {
@@ -315,6 +410,10 @@ Item {
     }
     onExited: function(code) {
       if (code === 0) root.actionError = ""
+      // Every action rewrites data.json, and logout removes auth.json;
+      // reload both through the readers rather than trusting the watchers.
+      root.readData()
+      root.readAuth()
       root.drainQueue()
     }
   }
@@ -324,7 +423,7 @@ Item {
       actionQueue = actionQueue.concat([args])
       return
     }
-    actionProc.command = [root.cli].concat(args)
+    actionProc.command = root.cappedCmd(args, root.errCapBytes, "stderr")
     actionProc.running = true
   }
 
@@ -333,7 +432,7 @@ Item {
     var queued = actionQueue.slice()
     var next = queued.shift()
     actionQueue = queued
-    actionProc.command = [root.cli].concat(next)
+    actionProc.command = root.cappedCmd(next, root.errCapBytes, "stderr")
     actionProc.running = true
   }
 
@@ -468,21 +567,45 @@ Item {
     return 0
   }
 
-  property FileView notifiedFile: FileView {
+  // Omarchy's daemon clamps every non-critical toast to thirty seconds at
+  // most, so "stays until dismissed" can only be expressed as critical
+  // urgency. Critical notify-send also bypasses Do Not Disturb, which is
+  // exactly right for a reminder and exactly why it stays a toggle.
+  readonly property bool persistentNotifs: boolSetting("persistentReminders", true)
+
+  // Writer only — hydration happens through the bounded reader below, so a
+  // user-writable file of any size never enters the process whole. atomic
+  // writes keep a torn file from being read back as garbage after a crash.
+  FileView {
+    id: notifiedFile
     path: root.statePath + "/notified.json"
     watchChanges: false
+    preload: false
+    atomicWrites: true
     printErrors: false
-    onLoaded: {
-      try { root.notifiedMap = JSON.parse(text()) || {} } catch (e) { root.notifiedMap = {} }
-      root.checkReminders()
+  }
+
+  function readNotified() {
+    if (notifiedReadProc.running) return
+    notifiedReadProc.command = root.boundedRead(root.statePath + "/notified.json", root.stateReadLimit)
+    notifiedReadProc.running = true
+  }
+
+  Process {
+    id: notifiedReadProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.notifiedMap = Model.parseNotified(String(text || ""))
+        root.checkReminders()
+      }
     }
-    onLoadFailed: root.notifiedMap = {}
   }
 
   function markNotified(key) {
-    var next = {}
-    for (var k in notifiedMap) next[k] = notifiedMap[k]
-    next[key] = Math.floor(Date.now() / 1000)
+    var nowSec = Math.floor(Date.now() / 1000)
+    var next = Model.pruneNotified(notifiedMap, nowSec)
+    next[key] = nowSec
     notifiedMap = next
     notifiedFile.setText(JSON.stringify(next))
   }
@@ -507,7 +630,7 @@ Item {
       root.markNotified(key)
       notifyProc.command = [
         "notify-send", "-a", "To Do",
-        "-u", (overdueCount > 0 ? "critical" : "normal"),
+        "-u", (root.persistentNotifs || overdueCount > 0 ? "critical" : "normal"),
         Model.elide(t.title, 80),
         (t.recurType !== "" ? "\u21bb recurring \u00b7 " : "") + "due " + Model.dueLabel(Model.effectiveDue(t), Date.now())
       ]
@@ -583,7 +706,8 @@ Item {
     if (!root.pomoNotifies) return
     // Owns its process so a toast never collides with a task reminder
     // racing through notifyProc.
-    pomoNotifyProc.command = ["notify-send", "-a", "To Do", "-u", "normal",
+    pomoNotifyProc.command = ["notify-send", "-a", "To Do",
+                              "-u", root.persistentNotifs ? "critical" : "normal",
                               Model.elide(title, 80), body]
     pomoNotifyProc.running = true
   }
@@ -644,22 +768,38 @@ Item {
     pomoFile.setText(JSON.stringify(next))
   }
 
+  // Writer only, like notifiedFile; the bounded reader below hydrates it.
   FileView {
     id: pomoFile
     path: root.statePath + "/pomo.json"
     watchChanges: false
+    preload: false
+    atomicWrites: true
     printErrors: false
-    onLoaded: {
-      try { root.pomoState = JSON.parse(text()) || {} } catch (e) { root.pomoState = {} }
-      root.rollPomoDay()
+  }
+
+  function readPomo() {
+    if (pomoReadProc.running) return
+    pomoReadProc.command = root.boundedRead(root.statePath + "/pomo.json", root.stateReadLimit)
+    pomoReadProc.running = true
+  }
+
+  Process {
+    id: pomoReadProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.pomoState = Model.parsePomoState(String(text || ""))
+        root.rollPomoDay()
+      }
     }
-    onLoadFailed: root.pomoState = {}
   }
 
   Component.onCompleted: {
-    // Seed the state dir so FileView finds something on first run; the
-    // probes reload once seeding exits. Sync happens via the startup timer
-    // above. The plugin only ever touches its own mstodo tree.
+    // Seed the state dir so first-run writes and the readers have somewhere
+    // to land; the readers re-check once seeding exits. Sync happens via
+    // the startup timer above. The plugin only ever touches its own mstodo
+    // tree.
     seedProc.command = ["bash", "-c",
       "d=\"$HOME/.local/state/omarchy/mstodo\"; mkdir -p \"$d\"; " +
       "f=\"$d/notified.json\"; [[ -f \"$f\" ]] || printf '{}' > \"$f\"; " +
@@ -670,11 +810,12 @@ Item {
   Process {
     id: seedProc
     onExited: {
-      // The probes re-check now that the state dir certainly exists.
-      dataFile.reload()
-      authProbe.reload()
-      notifiedFile.reload()
-      pomoFile.reload()
+      // Initial hydration through the same bounded readers; from here on
+      // the CLI-exit hooks and the file watchers keep everything current.
+      root.readData()
+      root.readAuth()
+      root.readNotified()
+      root.readPomo()
     }
   }
 }

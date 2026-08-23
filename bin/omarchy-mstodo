@@ -302,8 +302,14 @@ def graph_datetime(epoch: float) -> dict:
     }
 
 
-def build_task_payload(parsed: dict) -> dict:
-    """Parsed quick-add -> Graph todoTask create/update body."""
+def build_task_payload(parsed: dict, now: datetime | None = None) -> dict:
+    """Parsed quick-add -> Graph todoTask create/update body.
+
+    `now` is injectable so tests can freeze the clock; production callers
+    leave it unset.
+    """
+    if now is None:
+        now = datetime.now()
     body: dict = {"title": parsed["title"]}
 
     # Graph refuses a recurrence without a dueDateTime (it anchors the
@@ -311,7 +317,6 @@ def build_task_payload(parsed: dict) -> dict:
     # today" — or tomorrow when the stated time already passed.
     if parsed["recur"] and not parsed["due_date"]:
         t = parsed["time"] or (23, 59)
-        now = datetime.now()
         base = now.date()
         if (now.hour, now.minute) >= t:
             base = base + timedelta(days=1)
@@ -326,7 +331,7 @@ def build_task_payload(parsed: dict) -> dict:
 
     recur_key = parsed["recur"]
     interval_n = parsed["every_n"]
-    start_day = (parsed["due_date"] or date.today()).isoformat()
+    start_day = (parsed["due_date"] or now.date()).isoformat()
     range_end = parsed.get("recur_until")
 
     def recur_range() -> dict:

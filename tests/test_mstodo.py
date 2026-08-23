@@ -26,6 +26,7 @@ cli = importlib.util.module_from_spec(spec)
 loader.exec_module(cli)
 
 TODAY = date(2026, 8, 22)          # a Saturday
+NOW = datetime(2026, 8, 22, 12, 0)  # noon of that Saturday, frozen
 MONDAY = date(2026, 8, 24)
 
 
@@ -100,7 +101,7 @@ class QuickAddParsing(unittest.TestCase):
     def test_after_completion_maps_to_regenerating(self):
         p = cli.parse_quick_add("change sheets repeat after-completion", TODAY)
         self.assertEqual(p["recur"], "after")
-        body = cli.build_task_payload(p)
+        body = cli.build_task_payload(p, NOW)
         self.assertEqual(body["recurrence"]["pattern"]["type"], "regenerating")
         self.assertEqual(body["recurrence"]["range"]["startDate"], TODAY.isoformat())
 
@@ -149,7 +150,7 @@ class UntilSuffix(unittest.TestCase):
 
     def test_payload_end_date_range(self):
         p = cli.parse_quick_add("study @28.8 07:15 repeat daily until 9.9", TODAY)
-        body = cli.build_task_payload(p)
+        body = cli.build_task_payload(p, NOW)
         rng = body["recurrence"]["range"]
         self.assertEqual(rng["type"], "endDate")
         self.assertEqual(rng["startDate"], date(2026, 8, 28).isoformat())
@@ -157,7 +158,7 @@ class UntilSuffix(unittest.TestCase):
         self.assertEqual(body["recurrence"]["pattern"]["type"], "daily")
 
     def test_without_until_range_stays_noend(self):
-        body = cli.build_task_payload(cli.parse_quick_add("t repeat daily", TODAY))
+        body = cli.build_task_payload(cli.parse_quick_add("t repeat daily", TODAY), NOW)
         self.assertEqual(body["recurrence"]["range"]["type"], "noEnd")
 
     def test_label_appends_until(self):
@@ -168,7 +169,7 @@ class UntilSuffix(unittest.TestCase):
 class PayloadMapping(unittest.TestCase):
     def test_due_without_time_is_end_of_day_and_no_reminder(self):
         p = cli.parse_quick_add("pay rent @tomorrow", TODAY)
-        body = cli.build_task_payload(p)
+        body = cli.build_task_payload(p, NOW)
         expected = cli.local_epoch(TODAY + timedelta(days=1), (23, 59))
         self.assertEqual(
             body["dueDateTime"],
@@ -180,7 +181,7 @@ class PayloadMapping(unittest.TestCase):
 
     def test_time_sets_reminder(self):
         p = cli.parse_quick_add("demo @mon 09:30", TODAY)
-        body = cli.build_task_payload(p)
+        body = cli.build_task_payload(p, NOW)
         expected = cli.local_epoch(MONDAY, (9, 30))
         self.assertIn("reminderDateTime", body)
         self.assertTrue(body["isReminderOn"])
@@ -199,7 +200,7 @@ class PayloadMapping(unittest.TestCase):
         }
         for keyword, (ptype, interval) in cases.items():
             p = cli.parse_quick_add(f"t repeat {keyword}", TODAY)
-            body = cli.build_task_payload(p)
+            body = cli.build_task_payload(p, NOW)
             self.assertEqual(body["recurrence"]["pattern"]["type"], ptype)
             self.assertEqual(body["recurrence"]["pattern"]["interval"], interval)
             self.assertEqual(body["recurrence"]["range"]["type"], "noEnd")
@@ -207,7 +208,7 @@ class PayloadMapping(unittest.TestCase):
     def test_recurrence_without_date_synthesizes_due(self):
         # Graph requires dueDateTime on any recurring task; the CLI anchors
         # it today/tomorrow and uses it as the range startDate.
-        body = cli.build_task_payload(cli.parse_quick_add("study @7:00 repeat daily", TODAY))
+        body = cli.build_task_payload(cli.parse_quick_add("study @7:00 repeat daily", TODAY), NOW)
         self.assertIn("dueDateTime", body)
         self.assertTrue(body.get("isReminderOn"))
         self.assertIn("startDate", body["recurrence"]["range"])
@@ -218,36 +219,36 @@ class PayloadMapping(unittest.TestCase):
         for line in ("bins repeat weekly",
                      "x repeat after completion",
                      "y repeat every 2 days"):
-            body = cli.build_task_payload(cli.parse_quick_add(line, TODAY))
+            body = cli.build_task_payload(cli.parse_quick_add(line, TODAY), NOW)
             self.assertIn("dueDateTime", body)
             self.assertIn("startDate", body["recurrence"]["range"])
 
     def test_weekdays_carries_days_of_week(self):
         p = cli.parse_quick_add("standup repeat weekdays", TODAY)
-        body = cli.build_task_payload(p)
+        body = cli.build_task_payload(p, NOW)
         pattern = body["recurrence"]["pattern"]
         self.assertEqual(pattern["type"], "weekly")
         self.assertEqual(pattern["daysOfWeek"],
                          ["monday", "tuesday", "wednesday", "thursday", "friday"])
 
     def test_every_n_maps_units(self):
-        p3d = cli.build_task_payload(cli.parse_quick_add("x repeat every 3 days", TODAY))
+        p3d = cli.build_task_payload(cli.parse_quick_add("x repeat every 3 days", TODAY), NOW)
         self.assertEqual((p3d["recurrence"]["pattern"]["type"],
                           p3d["recurrence"]["pattern"]["interval"]), ("daily", 3))
-        p2w = cli.build_task_payload(cli.parse_quick_add("x repeat every 2 weeks", TODAY))
+        p2w = cli.build_task_payload(cli.parse_quick_add("x repeat every 2 weeks", TODAY), NOW)
         self.assertEqual((p2w["recurrence"]["pattern"]["type"],
                           p2w["recurrence"]["pattern"]["interval"]), ("weekly", 2))
-        p6m = cli.build_task_payload(cli.parse_quick_add("x repeat every 6 months", TODAY))
+        p6m = cli.build_task_payload(cli.parse_quick_add("x repeat every 6 months", TODAY), NOW)
         self.assertEqual((p6m["recurrence"]["pattern"]["type"],
                           p6m["recurrence"]["pattern"]["interval"]),
                          ("absoluteMonthly", 6))
 
     def test_importance(self):
-        body = cli.build_task_payload(cli.parse_quick_add("urgent thing !high", TODAY))
+        body = cli.build_task_payload(cli.parse_quick_add("urgent thing !high", TODAY), NOW)
         self.assertEqual(body["importance"], "high")
 
     def test_plain_title_payload_minimal(self):
-        body = cli.build_task_payload(cli.parse_quick_add("only a title", TODAY))
+        body = cli.build_task_payload(cli.parse_quick_add("only a title", TODAY), NOW)
         self.assertEqual(body, {"title": "only a title"})
 
     def test_recur_labels(self):

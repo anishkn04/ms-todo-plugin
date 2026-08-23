@@ -63,15 +63,68 @@ function parseJson(text) {
   try { return JSON.parse(String(text || "")) } catch (e) { return null }
 }
 
+// Parse-time caps are the second line of defense behind the service's
+// bounded file reads: a hand-tampered or truncated data.json must not be
+// able to balloon the model either. The CLI fetches at most 250 tasks per
+// sync, so anything past these bounds was never written by it.
+var MAX_CACHE_TASKS = 1000
+var MAX_CACHE_TEXT = 200
+
 function parseCache(text) {
   var raw = parseJson(text) || {}
+  var tasks = []
+  if (Array.isArray(raw.tasks)) {
+    for (var i = 0; i < raw.tasks.length && tasks.length < MAX_CACHE_TASKS; i++) {
+      var t = raw.tasks[i]
+      if (!t || typeof t !== "object") continue
+      t.title = String(t.title || "").slice(0, MAX_CACHE_TEXT)
+      tasks.push(t)
+    }
+  }
   return {
     syncedAt: typeof raw.syncedAt === "number" ? raw.syncedAt : 0,
     authRequired: raw.authRequired === true,
-    account: String(raw.account || ""),
+    account: String(raw.account || "").slice(0, MAX_CACHE_TEXT),
     listId: String(raw.listId || ""),
-    listName: String(raw.listName || ""),
-    tasks: Array.isArray(raw.tasks) ? raw.tasks : []
+    listName: String(raw.listName || "").slice(0, MAX_CACHE_TEXT),
+    tasks: tasks
+  }
+}
+
+// ---- local state files -----------------------------------------------------
+//
+// notified.json maps "<taskId>:<remindEpoch>" to the epoch it fired at;
+// pomo.json is today's focus tally. Both are read back through bounded
+// readers in the service, so these parsers only ever see a capped prefix.
+
+var NOTIFIED_KEEP_SEC = 14 * 24 * 3600
+
+function parseNotified(text) {
+  var raw = parseJson(text)
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {}
+  return raw
+}
+
+// Entries older than the keep window can never re-fire: checkReminders
+// silently skips-and-marks anything stale before this session started.
+// Pruning on every write keeps the map inside its read cap forever.
+function pruneNotified(map, nowSec) {
+  var horizon = Math.floor(nowSec) - NOTIFIED_KEEP_SEC
+  var next = {}
+  for (var k in map) {
+    var at = Number(map[k])
+    if (String(k) !== "" && isFinite(at) && at > horizon) next[k] = at
+  }
+  return next
+}
+
+function parsePomoState(text) {
+  var raw = parseJson(text)
+  if (!raw || typeof raw !== "object") return { dateKey: "", blocks: 0, minutes: 0 }
+  return {
+    dateKey: String(raw.dateKey || ""),
+    blocks: Number(raw.blocks) || 0,
+    minutes: Number(raw.minutes) || 0
   }
 }
 
@@ -417,4 +470,31 @@ function pomoStatsLabel(stats) {
   if (count === 0 && minutes === 0) return ""
   var head = count + (count === 1 ? " block" : " blocks")
   return minutes > 0 ? head + " \u00b7 " + minutes + "m" : head
+}
+
+// QML imports this file directly; node (tests/model.test.js) needs the same
+// functions as a module. QML's V4 engine has no `module`, so this is inert
+// there.
+if (typeof module !== "undefined") {
+  module.exports = {
+    elide: elide,
+    plain: plain,
+    safeLoginUri: safeLoginUri,
+    parseJson: parseJson,
+    parseCache: parseCache,
+    parseNotified: parseNotified,
+    pruneNotified: pruneNotified,
+    parsePomoState: parsePomoState,
+    sectionize: sectionize,
+    overdueCount: overdueCount,
+    dueTodayCount: dueTodayCount,
+    nextTitle: nextTitle,
+    nextBarLine: nextBarLine,
+    formatClock: formatClock,
+    pomoPhaseAfter: pomoPhaseAfter,
+    pomoPhaseSeconds: pomoPhaseSeconds,
+    pomoPhaseLabel: pomoPhaseLabel,
+    pomoDateKey: pomoDateKey,
+    pomoStatsLabel: pomoStatsLabel
+  }
 }

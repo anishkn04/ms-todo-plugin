@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.3.0 — 2026-08-23
+
+Bounded state IO and persistent notifications.
+
+- Nothing on disk is materialized into the shell whole anymore. `data.json`
+  (remote-derived), `auth.json`, `notified.json`, and `pomo.json`
+  (user-writable) are read through bounded readers — `timeout 5 head -c`,
+  256 KiB for the task cache, 4–16 KiB for the small files — so an
+  oversized or hostile state file can no longer exhaust the long-lived
+  shell before parsing. The FileView objects remain only as change
+  watchers and writers (`atomicWrites` on).
+- CLI output is capped at the producer: sync/action stderr and login
+  stdout pass through `head -c` inside a `pipefail` wrapper (SIGPIPE ends
+  runaway children), and the login processes' previously buffered stderr
+  is discarded instead of collected without limit.
+- Parse-time caps back the readers: at most 1000 tasks with ≤200-character
+  titles/accounts reach the model, notified-map entries older than 14 days
+  are pruned on every write, and focus stats parse to a fixed shape.
+- New *Persistent notifications* toggle (default on): task reminders and
+  focus toasts use critical urgency, which Omarchy's daemon holds until
+  dismissed and across shell restarts. Critical urgency bypasses Do Not
+  Disturb, hence it being a setting rather than an assumption.
+- Test suite fixes: `build_task_payload` accepts an injectable clock and
+  every payload test now freezes time, so the suite no longer breaks at
+  midnight; Model.js gained a node test module.
+
 ## 0.2.0 — 2026-08-22
 
 Bar display modes and hardening.
