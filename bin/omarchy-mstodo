@@ -64,19 +64,86 @@ Settings (via `omarchy-mstodo settings` or `omarchy bar set anishkn.mstodo`):
 """
 
 import argparse
-
-import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+
+# --------------------------------------------------------------------------
+# bounded file reads — protect against oversized / malicious state files
+# and FIFO/special-file substitutions that could block the CLI indefinitely.
+# Limits mirror the shell-side caps (Service.qml).
+# --------------------------------------------------------------------------
+
+READ_TIMEOUT_SECONDS = 5
+
+# Per-file byte limits (must match Service.qml's head -c caps)
+MAX_CACHE_BYTES = 256 * 1024      # data.json — 256 KiB
+MAX_AUTH_BYTES = 16 * 1024        # auth.json — 16 KiB
+MAX_LOGIN_BYTES = 16 * 1024       # login.json — 16 KiB
+MAX_CONFIG_BYTES = 4 * 1024       # config.json — 4 KiB
+MAX_MANIFEST_BYTES = 64 * 1024    # manifest.json — 64 KiB
+MAX_SHELL_JSON_BYTES = 64 * 1024  # shell.json — 64 KiB
+
+
+class FileReadTimeout(OSError):
+    """Raised when a file read exceeds the timeout (likely FIFO/special file)."""
+    pass
+
+
+class FileReadLimitExceeded(ValueError):
+    """Raised when a file exceeds its maximum allowed size."""
+    pass
+
+
+@contextmanager
+def _read_timeout(seconds: int):
+    """Signal-based timeout for blocking I/O operations (Unix only)."""
+    def _handler(signum, frame):
+        raise FileReadTimeout(f"read timed out after {seconds}s (possible FIFO/special file)")
+    old_handler = signal.signal(signal.SIGALRM, _handler)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old_handler)
+
+
+def _read_file_bounded(path: str, max_bytes: int) -> str:
+    """Read at most max_bytes from path with timeout; raise on timeout or limit exceeded."""
+    try:
+        with _read_timeout(READ_TIMEOUT_SECONDS):
+            with open(path, "rb") as fh:
+                data = fh.read(max_bytes + 1)
+                if len(data) > max_bytes:
+                    raise FileReadLimitExceeded(f"file exceeds {max_bytes} bytes")
+                return data.decode("utf-8")
+    except FileReadTimeout:
+        raise
+    except OSError as e:
+        if e.errno == 2:  # ENOENT
+            raise
+        raise FileReadTimeout(f"read failed: {e}")
+
+
+def load_json(path: str, fallback, *, max_bytes: int = MAX_CONFIG_BYTES):
+    """Load JSON from a bounded, timeout-protected file read."""
+    try:
+        raw = _read_file_bounded(path, max_bytes)
+        return json.loads(raw)
+    except (OSError, ValueError, FileReadTimeout, FileReadLimitExceeded):
+        return fallback
+
 
 # --------------------------------------------------------------------------
 # constants
@@ -409,13 +476,6 @@ def recur_label(parsed: dict) -> str:
 # --------------------------------------------------------------------------
 # token storage
 
-def load_json(path: str, fallback):
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except (OSError, ValueError):
-        return fallback
-
 
 def save_json_atomic(path: str, data) -> None:
     directory = os.path.dirname(path)
@@ -437,7 +497,7 @@ def client_id(tokens: dict) -> str:
 
 
 def load_tokens() -> dict:
-    return load_json(AUTH_PATH, {}) or {}
+    return load_json(AUTH_PATH, {}, max_bytes=MAX_AUTH_BYTES) or {}
 
 
 def access_token(tokens: dict) -> str:
@@ -542,7 +602,7 @@ def _save_pending(challenge: dict, cid: str) -> dict:
 
 
 def _load_pending() -> dict:
-    return load_json(LOGIN_PATH, {}) or {}
+    return load_json(LOGIN_PATH, {}, max_bytes=MAX_LOGIN_BYTES) or {}
 
 
 def _drop_pending() -> None:
@@ -836,13 +896,13 @@ def map_task(raw: dict) -> dict:
 # sync / status
 
 def write_cache(**fields) -> None:
-    cache = load_json(CACHE_PATH, {}) or {}
+    cache = load_json(CACHE_PATH, {}, max_bytes=MAX_CACHE_BYTES) or {}
     cache.update(fields)
     save_json_atomic(CACHE_PATH, cache)
 
 
 def read_config() -> dict:
-    config = load_json(CONFIG_PATH, {}) or {}
+    config = load_json(CONFIG_PATH, {}, max_bytes=MAX_CONFIG_BYTES) or {}
     if os.environ.get("OMARCHY_MSTODO_LIST"):
         config["listName"] = os.environ["OMARCHY_MSTODO_LIST"]
     return config
@@ -853,7 +913,7 @@ def cmd_sync(args) -> int:
     now = time.time()
 
     if args.max_age:
-        cached = load_json(CACHE_PATH, {}) or {}
+        cached = load_json(CACHE_PATH, {}, max_bytes=MAX_CACHE_BYTES) or {}
         fresh_at = cached.get("syncedAt", 0)
         if now - fresh_at < args.max_age and not cached.get("authRequired"):
             return 0
@@ -897,7 +957,7 @@ def cmd_sync(args) -> int:
 
 
 def cmd_status(_args) -> int:
-    cache = load_json(CACHE_PATH, {}) or {}
+    cache = load_json(CACHE_PATH, {}, max_bytes=MAX_CACHE_BYTES) or {}
     print(json.dumps(cache))
     return 0
 
@@ -905,7 +965,8 @@ def cmd_status(_args) -> int:
 def _load_manifest() -> dict:
     """Load the plugin manifest to get settings schema."""
     manifest_path = Path(__file__).resolve().parent.parent / "manifest.json"
-    return json.loads(manifest_path.read_text())
+    raw = _read_file_bounded(str(manifest_path), MAX_MANIFEST_BYTES)
+    return json.loads(raw)
 
 
 def _get_settings_schema() -> dict:
@@ -922,7 +983,8 @@ def _read_shell_settings() -> dict:
     shell_path = Path.home() / ".config" / "omarchy" / "shell.json"
     if not shell_path.exists():
         return {}
-    data = json.loads(shell_path.read_text())
+    raw = _read_file_bounded(str(shell_path), MAX_SHELL_JSON_BYTES)
+    data = json.loads(raw)
     for entry in data.get("bar", {}).get("layout", {}).get("left", []) + \
                    data.get("bar", {}).get("layout", {}).get("center", []) + \
                    data.get("bar", {}).get("layout", {}).get("right", []):
@@ -1125,7 +1187,7 @@ def select_groups(tasks: list[dict], include_done: bool) -> list[tuple[str, list
 
 
 def cmd_list(args) -> int:
-    cache = load_json(CACHE_PATH, {}) or {}
+    cache = load_json(CACHE_PATH, {}, max_bytes=MAX_CACHE_BYTES) or {}
     tasks = cache.get("tasks", [])
     scope = getattr(args, "scope", None) or ""
     show_done = bool(args.all_done) or scope == "all" or scope == "done"
@@ -1196,7 +1258,7 @@ def resolve_task_id(token: str, cache: dict) -> str:
 
 def full_task_id(token: str) -> str:
     require_task_id(token)
-    return resolve_task_id(token, load_json(CACHE_PATH, {}) or {})
+    return resolve_task_id(token, load_json(CACHE_PATH, {}, max_bytes=MAX_CACHE_BYTES) or {})
 
 
 class SystemExitWith(Exception):
@@ -1206,7 +1268,7 @@ class SystemExitWith(Exception):
 
 
 def mutate(method: str, task_id: str, body: dict | None = None) -> int:
-    cache = load_json(CACHE_PATH, {}) or {}
+    cache = load_json(CACHE_PATH, {}, max_bytes=MAX_CACHE_BYTES) or {}
     list_id = cache.get("listId")
     if not list_id:
         print("No cached list yet — run 'omarchy-mstodo sync' once.", file=sys.stderr)
@@ -1309,7 +1371,7 @@ def _create_or_update(task_id: str | None, line: str) -> int:
         print("Nothing to add — no title found.", file=sys.stderr)
         return 2
 
-    cache = load_json(CACHE_PATH, {}) or {}
+    cache = load_json(CACHE_PATH, {}, max_bytes=MAX_CACHE_BYTES) or {}
     list_id = cache.get("listId")
     if not list_id:
         print("No cached list yet — run 'omarchy-mstodo sync' first.", file=sys.stderr)
