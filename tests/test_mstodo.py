@@ -790,6 +790,97 @@ class MapTaskTimezones(unittest.TestCase):
         self.assertEqual(dt.hour, 12)
 
 
+class SecurityHardening(unittest.TestCase):
+    """Tests for the security hardening: bounded reads, atomic writes, caps."""
+
+    def setUp(self):
+        self.tmpdir = Path("/tmp/omarchy_test").resolve()
+        self.tmpdir.mkdir(exist_ok=True)
+        # Patch STATE_DIR for isolation
+        self._orig_state_dir = cli.STATE_DIR
+        cli.STATE_DIR = str(self.tmpdir)
+        cli.AUTH_PATH = os.path.join(cli.STATE_DIR, "auth.json")
+        cli.CACHE_PATH = os.path.join(cli.STATE_DIR, "data.json")
+        cli.CONFIG_PATH = os.path.join(cli.STATE_DIR, "config.json")
+        cli.LOGIN_PATH = os.path.join(cli.STATE_DIR, "login.json")
+
+    def tearDown(self):
+        cli.STATE_DIR = self._orig_state_dir
+        cli.AUTH_PATH = os.path.join(cli.STATE_DIR, "auth.json")
+        cli.CACHE_PATH = os.path.join(cli.STATE_DIR, "data.json")
+        cli.CONFIG_PATH = os.path.join(cli.STATE_DIR, "config.json")
+        cli.LOGIN_PATH = os.path.join(cli.STATE_DIR, "login.json")
+        # Clean up temp dir
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_read_file_bounded_normal(self):
+        path = self.tmpdir / "normal.json"
+        path.write_text('{"foo": "bar"}')
+        result = cli._read_file_bounded(str(path), 1024)
+        self.assertEqual(result, '{"foo": "bar"}')
+
+    def test_read_file_bounded_size_limit(self):
+        path = self.tmpdir / "large.json"
+        large_content = "x" * 2000
+        path.write_text(large_content)
+        with self.assertRaises(cli.FileReadLimitExceeded):
+            cli._read_file_bounded(str(path), 1024)
+
+    def test_read_file_bounded_fifo_timeout(self):
+        # Create a FIFO and ensure read times out (we don't write to it)
+        fifo_path = self.tmpdir / "test_fifo"
+        os.mkfifo(fifo_path)
+        try:
+            with self.assertRaises(cli.FileReadTimeout):
+                cli._read_file_bounded(str(fifo_path), 1024)
+        finally:
+            os.unlink(fifo_path)
+
+    def test_load_json_oversized_returns_fallback(self):
+        path = self.tmpdir / "cache.json"
+        path.write_text("x" * 500000)  # 500KB, exceeds MAX_CACHE_BYTES (256KB)
+        result = cli.load_json(str(path), {"fallback": True}, max_bytes=cli.MAX_CACHE_BYTES)
+        self.assertEqual(result, {"fallback": True})
+
+    def test_load_json_fifo_returns_fallback(self):
+        fifo_path = self.tmpdir / "fifo.json"
+        os.mkfifo(fifo_path)
+        try:
+            result = cli.load_json(str(fifo_path), {"fallback": True}, max_bytes=1024)
+            self.assertEqual(result, {"fallback": True})
+        finally:
+            os.unlink(fifo_path)
+
+    def test_load_json_valid_parses(self):
+        path = self.tmpdir / "valid.json"
+        path.write_text('{"key": "value"}')
+        result = cli.load_json(str(path), {"fallback": True}, max_bytes=1024)
+        self.assertEqual(result, {"key": "value"})
+
+    def test_save_json_atomic_perms_0600(self):
+        path = self.tmpdir / "atomic.json"
+        cli.save_json_atomic(str(path), {"key": "value"})
+        stat = os.stat(path)
+        # Check file is 0600 (owner read/write only)
+        self.assertEqual(stat.st_mode & 0o777, 0o600)
+
+    def test_save_json_atomic_atomic_replace(self):
+        path = self.tmpdir / "atomic.json"
+        cli.save_json_atomic(str(path), {"v": 1})
+        # Simulate concurrent write by writing directly then atomic should win
+        cli.save_json_atomic(str(path), {"v": 2})
+        with open(path) as f:
+            data = json.load(f)
+        self.assertEqual(data["v"], 2)
+
+    def test_save_json_atomic_dir_perms_0700(self):
+        path = self.tmpdir / "subdir" / "nested.json"
+        cli.save_json_atomic(str(path), {"key": "value"})
+        dir_stat = os.stat(os.path.dirname(path))
+        self.assertEqual(dir_stat.st_mode & 0o777, 0o700)
+
+
 if __name__ == "__main__":
     print(json.dumps({"suite": "omarchy-mstodo", "bin": str(BIN), "exists": BIN.exists()}))
     unittest.main(verbosity=2)

@@ -133,6 +133,13 @@ Item {
     }
   }
 
+  // Watchdog: bounded read should complete within 5s (timeout in shell wrapper).
+  Timer {
+    interval: 5000
+    running: dataReadProc.running
+    onTriggered: { dataReadProc.running = false }
+  }
+
   FileView {
     id: authWatch
     path: root.statePath + "/auth.json"
@@ -165,6 +172,13 @@ Item {
     onExited: {
       if (root.authReadQueued) root.readAuth()
     }
+  }
+
+  // Watchdog: bounded read should complete within 5s (timeout in shell wrapper).
+  Timer {
+    interval: 5000
+    running: authReadProc.running
+    onTriggered: { authReadProc.running = false }
   }
 
   SystemClock {
@@ -215,15 +229,16 @@ Item {
   // and SIGPIPE ends a runaway child — while pipefail preserves the CLI's
   // exit code. The "stderr" capture also forwards stdout (which is empty
   // for our sync/action paths) so it, too, is bounded.
-  function cappedCmd(args, capBytes, capture) {
-    var redirect = capture === "stdout"
-      ? "2>/dev/null | head -c " + capBytes
-      : "2>&1 | head -c " + capBytes
-    return ["sh", "-c", 'set -o pipefail; "$0" "$@" ' + redirect, root.cli].concat(args)
-  }
-
+  // Caps are hardcoded constants to avoid any interpolation into the shell command.
   readonly property int errCapBytes: 8192     // an error message, generously
   readonly property int jsonCapBytes: 16384   // login status objects
+
+  function cappedCmd(args, capture) {
+    var redirect = capture === "stdout"
+      ? "2>/dev/null | head -c " + root.jsonCapBytes
+      : "2>&1 | head -c " + root.errCapBytes
+    return ["sh", "-c", 'set -o pipefail; "$0" "$@" ' + redirect, root.cli].concat(args)
+  }
 
   function refresh(force) {
     if (!root.signedIn) return
@@ -231,7 +246,7 @@ Item {
     var args = force === false
       ? ["sync", "--max-age", String(Math.max(30, refreshIntervalSec - 15))]
       : ["sync"]
-    syncProc.command = root.cappedCmd(args, root.errCapBytes, "stderr")
+    syncProc.command = root.cappedCmd(args, "stderr")
     syncProc.running = true
   }
 
@@ -251,6 +266,14 @@ Item {
       // directory did not exist yet when this service started.
       root.readData()
     }
+  }
+
+  // Watchdog: kill sync if it hangs longer than 15s (covers FIFO stalls the
+  // CLI might hit before its own timeout fires).
+  Timer {
+    interval: 15000
+    running: syncProc.running
+    onTriggered: { syncProc.running = false }
   }
 
   Timer {
@@ -292,7 +315,7 @@ Item {
     root.loginCode = ""
     root.loginUri = ""
     root.loginSlowDowns = 0
-    loginStartProc.command = root.cappedCmd(["login", "start"], root.jsonCapBytes, "stdout")
+    loginStartProc.command = root.cappedCmd(["login", "start"], "stdout")
     loginStartProc.running = true
   }
 
@@ -321,6 +344,13 @@ Item {
     command: ["true"]
   }
 
+  // Watchdog: wl-copy fork should complete quickly.
+  Timer {
+    interval: 2000
+    running: copyProc.running
+    onTriggered: { copyProc.running = false }
+  }
+
   function pollSignIn() {
     if (!root.signingIn) return
     if (Date.now() >= root.loginExpiresAt) {
@@ -329,7 +359,7 @@ Item {
       return
     }
     if (loginPollProc.running) return
-    loginPollProc.command = root.cappedCmd(["login", "poll"], root.jsonCapBytes, "stdout")
+    loginPollProc.command = root.cappedCmd(["login", "poll"], "stdout")
     loginPollProc.running = true
   }
 
@@ -353,6 +383,13 @@ Item {
         Qt.openUrlExternally(root.loginUri)
       }
     }
+  }
+
+  // Watchdog: device-code request should complete within 10s.
+  Timer {
+    interval: 10000
+    running: loginStartProc.running
+    onTriggered: { loginStartProc.running = false }
   }
 
   Process {
@@ -387,6 +424,13 @@ Item {
     }
   }
 
+  // Watchdog: token poll should complete within 10s.
+  Timer {
+    interval: 10000
+    running: loginPollProc.running
+    onTriggered: { loginPollProc.running = false }
+  }
+
   Timer {
     id: loginPollTimer
     interval: Math.min(30, Math.max(2, root.loginPollIntervalSec + root.loginSlowDowns * 5)) * 1000
@@ -418,12 +462,19 @@ Item {
     }
   }
 
+  // Watchdog: mutation should complete within 10s.
+  Timer {
+    interval: 10000
+    running: actionProc.running
+    onTriggered: { actionProc.running = false }
+  }
+
   function runAction(args) {
     if (actionProc.running) {
       actionQueue = actionQueue.concat([args])
       return
     }
-    actionProc.command = root.cappedCmd(args, root.errCapBytes, "stderr")
+    actionProc.command = root.cappedCmd(args, "stderr")
     actionProc.running = true
   }
 
@@ -432,7 +483,7 @@ Item {
     var queued = actionQueue.slice()
     var next = queued.shift()
     actionQueue = queued
-    actionProc.command = root.cappedCmd(next, root.errCapBytes, "stderr")
+    actionProc.command = root.cappedCmd(next, "stderr")
     actionProc.running = true
   }
 
@@ -600,6 +651,13 @@ Item {
         root.checkReminders()
       }
     }
+  }
+
+  // Watchdog: bounded read should complete within 5s.
+  Timer {
+    interval: 5000
+    running: notifiedReadProc.running
+    onTriggered: { notifiedReadProc.running = false }
   }
 
   function markNotified(key) {
@@ -795,6 +853,13 @@ Item {
     }
   }
 
+  // Watchdog: bounded read should complete within 5s.
+  Timer {
+    interval: 5000
+    running: pomoReadProc.running
+    onTriggered: { pomoReadProc.running = false }
+  }
+
   Component.onCompleted: {
     // Seed the state dir so first-run writes and the readers have somewhere
     // to land; the readers re-check once seeding exits. Sync happens via
@@ -817,5 +882,12 @@ Item {
       root.readNotified()
       root.readPomo()
     }
+  }
+
+  // Watchdog: seeding should complete within 5s.
+  Timer {
+    interval: 5000
+    running: seedProc.running
+    onTriggered: { seedProc.running = false }
   }
 }

@@ -188,6 +188,37 @@ MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_ERROR_BYTES = 64 * 1024
 
 
+MAX_TASKS_FETCH = 250
+HTTP_TIMEOUT = 30
+# Wall-clock timeout for the entire HTTP request (connect + body).
+# urllib's timeout only covers connection; this covers slowloris body drips.
+REQUEST_WALL_TIMEOUT = 30
+
+# Microsoft endpoints return small JSON documents, but a hostile or broken
+# peer must not control how much memory a bar plugin reads. Error payloads
+# are tiny by spec; anything longer is truncated before parsing.
+MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_ERROR_BYTES = 64 * 1024
+
+
+@contextmanager
+def request_timeout(seconds: int = REQUEST_WALL_TIMEOUT):
+    """Signal-based wall-clock timeout for the entire HTTP request (Unix only).
+
+    Covers both connection and body streaming. urllib's `timeout` only covers
+    connection establishment; this caps the entire request lifetime.
+    """
+    def _handler(signum, frame):
+        raise NetworkError(f"request exceeded {seconds}s wall timeout")
+    old = signal.signal(signal.SIGALRM, _handler)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
+
+
 def read_body_limited(resp, limit: int = MAX_RESPONSE_BYTES) -> str:
     """Read at most `limit` bytes; raise ApiError when the peer sends more."""
     data = resp.read(limit + 1)
@@ -480,11 +511,19 @@ def recur_label(parsed: dict) -> str:
 def save_json_atomic(path: str, data) -> None:
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
-    os.chmod(directory, 0o700)  # tokens live here; every caller writes under STATE_DIR
+    os.chmod(directory, 0o700)  # always re-verify perms, not just on create
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=1)
-    os.chmod(tmp, 0o600)
+    # Create temp file with 0600 from the start — no race window
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=1)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     os.replace(tmp, path)
 
 
@@ -537,9 +576,10 @@ def http_form(url: str, fields: dict) -> dict:
         "Accept": "application/json",
     })
     try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-            raw = read_body_limited(resp)
-            return json.loads(raw)
+        with request_timeout():
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                raw = read_body_limited(resp)
+                return json.loads(raw)
     except urllib.error.HTTPError as exc:
         try:
             payload = json.loads(exc.read(MAX_ERROR_BYTES).decode())
@@ -794,9 +834,10 @@ def graph_request(method: str, path: str, body: dict | None = None, params: dict
         "Accept": "application/json",
     })
     try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-            raw = read_body_limited(resp)
-            return json.loads(raw) if raw.strip() else {}
+        with request_timeout():
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                raw = read_body_limited(resp)
+                return json.loads(raw) if raw.strip() else {}
     except urllib.error.HTTPError as exc:
         try:
             payload = json.loads(exc.read(MAX_ERROR_BYTES).decode())
@@ -827,6 +868,8 @@ def fetch_all_tasks(list_id: str) -> list[dict]:
     safe_list = urllib.parse.quote(str(list_id), safe="")
     url = f"{GRAPH}/me/todo/lists/{safe_list}/tasks?$top={MAX_TASKS_FETCH}"
     tasks: list[dict] = []
+    # Allow only graph.microsoft.com on port 443 (or no explicit port).
+    ALLOWED_GRAPH_HOSTS = {"graph.microsoft.com", "graph.microsoft.com:443"}
     while len(tasks) < MAX_TASKS_FETCH:
         payload = graph_request("GET", url[len(GRAPH):])
         values = payload.get("value", [])
@@ -837,8 +880,11 @@ def fetch_all_tasks(list_id: str) -> list[dict]:
         if not isinstance(nxt, str):
             break
         parsed = urllib.parse.urlparse(nxt)
+        hostport = parsed.hostname
+        if parsed.port:
+            hostport += f":{parsed.port}"
         if (parsed.scheme != "https"
-                or (parsed.hostname or "") != "graph.microsoft.com"
+                or hostport not in ALLOWED_GRAPH_HOSTS
                 or not parsed.path.startswith("/v1.0/")):
             break
         url = nxt
