@@ -181,15 +181,6 @@ LOGIN_PATH = os.path.join(STATE_DIR, "login.json")
 
 MAX_TASKS_FETCH = 250
 HTTP_TIMEOUT = 30
-# Microsoft endpoints return small JSON documents, but a hostile or broken
-# peer must not control how much memory a bar plugin reads. Error payloads
-# are tiny by spec; anything longer is truncated before parsing.
-MAX_RESPONSE_BYTES = 4 * 1024 * 1024
-MAX_ERROR_BYTES = 64 * 1024
-
-
-MAX_TASKS_FETCH = 250
-HTTP_TIMEOUT = 30
 # Wall-clock timeout for the entire HTTP request (connect + body).
 # urllib's timeout only covers connection; this covers slowloris body drips.
 REQUEST_WALL_TIMEOUT = 30
