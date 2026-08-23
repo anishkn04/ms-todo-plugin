@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
-"""Microsoft To Do client for the Omarchy shell plugin (anishkn.mstodo).
+from __future__ import annotations
 
-Why a CLI and not XMLHttpRequest inside QML: the OAuth refresh token is a
-long-lived credential that belongs in a 0600 file rather than in the shell's
-process state, the device-code login needs a polling loop with backoff, and
-the quick-add grammar is ordinary string parsing that is miserable to unit
-test in QML and trivial in Python. The shell only ever runs this binary and
-parses JSON.
+# Microsoft To Do client for the Omarchy shell plugin (anishkn.mstodo).
+#
+# Why a CLI and not XMLHttpRequest inside QML: the OAuth refresh token is a
+# long-lived credential that belongs in a 0600 file rather than in the shell's
+# process state, the device-code login needs a polling loop with backoff, and
+# the quick-add grammar is ordinary string parsing that is miserable to unit
+# test in QML and trivial in Python. The shell only ever runs this binary and
+# parses JSON.
+#
+# Auth is Microsoft's public device-code flow. The default tenant is /common;
+# apps registered for personal accounts only are retried under /consumers and
+# the choice is remembered. The bundled client id belongs to this plugin's
+# own registered public app; if a tenant rejects it, register a free app
+# (README) and put its id in OMARCHY_MSTODO_CLIENT_ID or auth.json's
+# "client_id".
+#
+# All datetimes are sent as UTC instants ("timeZone": "UTC"); the cache stores
+# epoch seconds so QML never parses ISO strings.
 
-Auth is Microsoft's public device-code flow. The default tenant is /common;
-apps registered for personal accounts only are retried under /consumers and
-the choice is remembered. The bundled client id belongs to this plugin's
-own registered public app; if a tenant rejects it, register a free app
-(README) and put its id in OMARCHY_MSTODO_CLIENT_ID or auth.json's
-"client_id".
-
-All datetimes are sent as UTC instants ("timeZone": "UTC"); the cache stores
-epoch seconds so QML never parses ISO strings.
+__doc__ = """Microsoft To Do client for the Omarchy shell plugin (anishkn.mstodo).
 
 Commands:
   login                       authenticate via microsoft.com/link, then sync
@@ -33,6 +37,7 @@ Commands:
   uncomplete TASK_ID          reopen a completed task
   snooze TASK_ID WHEN         move due + reminder (@HH:MM, @tomorrow, ...)
   delete TASK_ID              delete a task
+  settings [KEY [VALUE]]      show or set plugin settings (wraps omarchy bar set)
 
 TASK_ID accepts the short id suffix shown by `list` when it is unique.
 
@@ -42,20 +47,36 @@ Quick-add grammar (all parts optional, order free):
         [!low|!normal|!high]
 
 Exit codes: 0 ok, 2 usage, 3 auth required, 4 network, 1 anything else.
+
+Settings (via `omarchy-mstodo settings` or `omarchy bar set anishkn.mstodo`):
+  persistentReminders   (bool)   default true  — critical urgency, never expires, bypasses DND
+  syncInterval          (enum)   2 minutes | 5 minutes | 15 minutes | 1 hour | Only when opened
+  notifyLeadMinutes     (enum)   At reminder time | 5 minutes before | 15 minutes before
+  undoSeconds           (int)    0..30
+  focusMinutes          (int)    1..180 (step 5)
+  shortBreakMinutes     (int)    1..60
+  longBreakMinutes      (int)    1..120 (step 5)
+  longBreakInterval     (int)    1..12
+  autoChain             (bool)   default true
+  pomoNotifications     (bool)   default true
+  maxTasksPerSection    (int)    3..30
+  listName              (str)    exact display name of the To Do list to use
 """
 
-from __future__ import annotations
+import argparse
 
 import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 # --------------------------------------------------------------------------
 # constants
@@ -881,6 +902,130 @@ def cmd_status(_args) -> int:
     return 0
 
 
+def _load_manifest() -> dict:
+    """Load the plugin manifest to get settings schema."""
+    manifest_path = Path(__file__).resolve().parent.parent / "manifest.json"
+    return json.loads(manifest_path.read_text())
+
+
+def _get_settings_schema() -> dict:
+    """Extract the settings schema keyed by setting name."""
+    manifest = _load_manifest()
+    schema = {}
+    for item in manifest.get("barWidget", {}).get("schema", []):
+        schema[item["key"]] = item
+    return schema
+
+
+def _read_shell_settings() -> dict:
+    """Read the plugin's current settings from shell.json."""
+    shell_path = Path.home() / ".config" / "omarchy" / "shell.json"
+    if not shell_path.exists():
+        return {}
+    data = json.loads(shell_path.read_text())
+    for entry in data.get("bar", {}).get("layout", {}).get("left", []) + \
+                   data.get("bar", {}).get("layout", {}).get("center", []) + \
+                   data.get("bar", {}).get("layout", {}).get("right", []):
+        if entry.get("id") == "anishkn.mstodo":
+            return {k: v for k, v in entry.items() if k != "id"}
+    return {}
+
+
+def _parse_bool(s: str) -> bool:
+    s = s.strip().lower()
+    if s in ("true", "on", "yes", "1"):
+        return True
+    if s in ("false", "off", "no", "0"):
+        return False
+    raise ValueError(f"invalid boolean: {s!r}")
+
+
+def cmd_settings(args) -> int:
+    """Show or set plugin settings via omarchy bar set."""
+    schema = _get_settings_schema()
+    shell_settings = _read_shell_settings()
+    defaults = _load_manifest().get("barWidget", {}).get("defaults", {})
+
+    if not args.key:
+        # Show all settings with current values (shell.json + defaults)
+        for key in sorted(schema.keys()):
+            spec = schema[key]
+            val = shell_settings.get(key, defaults.get(key))
+            if isinstance(val, bool):
+                val_str = "true" if val else "false"
+            elif isinstance(val, str) and val == "":
+                val_str = f"(default list)" if key == "listName" else '""'
+            else:
+                val_str = str(val)
+            desc = spec.get("description", "").split(".")[0]
+            print(f"{key}: {val_str}  # {desc}")
+        return 0
+
+    if args.key not in schema:
+        print(f"unknown setting: {args.key}", file=sys.stderr)
+        print("available:", ", ".join(sorted(schema.keys())), file=sys.stderr)
+        return 2
+
+    spec = schema[args.key]
+    if args.value is None:
+        # Show single setting
+        val = shell_settings.get(args.key, defaults.get(args.key))
+        if isinstance(val, bool):
+            val_str = "true" if val else "false"
+        elif isinstance(val, str) and val == "":
+            val_str = f"(default list)" if args.key == "listName" else '""'
+        else:
+            val_str = str(val)
+        print(f"{args.key}: {val_str}")
+        return 0
+
+    # Validate and convert the value
+    try:
+        if spec["type"] == "boolean":
+            val = _parse_bool(args.value)
+            json_val = json.dumps(val)
+        elif spec["type"] == "integer":
+            val = int(args.value)
+            if "min" in spec and val < spec["min"]:
+                raise ValueError(f"must be >= {spec['min']}")
+            if "max" in spec and val > spec["max"]:
+                raise ValueError(f"must be <= {spec['max']}")
+            if "step" in spec and spec["step"] > 1 and val % spec["step"] != 0:
+                raise ValueError(f"must be a multiple of {spec['step']}")
+            json_val = json.dumps(val)
+        elif spec["type"] == "enum":
+            if args.value not in spec["options"]:
+                raise ValueError(f"must be one of: {', '.join(spec['options'])}")
+            val = args.value
+            json_val = json.dumps(val)
+        elif spec["type"] == "string":
+            val = args.value
+            json_val = json.dumps(val)
+        else:
+            print(f"unsupported setting type: {spec['type']}", file=sys.stderr)
+            return 1
+    except ValueError as e:
+        print(f"invalid value for {args.key}: {e}", file=sys.stderr)
+        return 2
+
+    # Write via omarchy bar set
+    try:
+        subprocess.run(
+            ["omarchy", "bar", "set", "anishkn.mstodo", args.key, json_val],
+            check=True,
+        )
+    except FileNotFoundError:
+        print("omarchy command not found; run manually:", file=sys.stderr)
+        print(f"  omarchy bar set anishkn.mstodo {args.key} {json_val}", file=sys.stderr)
+        return 1
+    except subprocess.CalledProcessError as e:
+        print(f"omarchy bar set failed: {e}", file=sys.stderr)
+        return 1
+
+    print(f"Set {args.key} = {val}")
+    return 0
+
+
 # --------------------------------------------------------------------------
 # listing
 
@@ -1248,10 +1393,14 @@ def main(argv: list[str]) -> int:
     p_snooze.add_argument("task_id")
     p_snooze.add_argument("when", nargs="+", metavar="@WHEN")
 
+    p_settings = sub.add_parser("settings", help="show or set plugin settings")
+    p_settings.add_argument("key", nargs="?", default=None, help="setting name")
+    p_settings.add_argument("value", nargs="?", default=None, help="new value")
+
     args = parser.parse_args(argv)
     handlers = {
         "login": cmd_login, "logout": cmd_logout, "sync": cmd_sync, "status": cmd_status,
-        "list": cmd_list,
+        "list": cmd_list, "settings": cmd_settings,
         "add": cmd_add, "update": cmd_update, "complete": cmd_complete,
         "uncomplete": cmd_uncomplete, "delete": cmd_delete, "snooze": cmd_snooze,
     }

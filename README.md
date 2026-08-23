@@ -66,6 +66,41 @@ name:
 Sync cadence, undo window, reminder lead time, rows per section, and all
 focus-timer lengths are editable from Omarchy's plugin settings UI.
 
+## Configuration via CLI
+
+```bash
+# Show all settings (current values from shell.json + manifest defaults)
+omarchy-mstodo settings
+
+# Show a single setting
+omarchy-mstodo settings persistentReminders
+
+# Toggle persistent notifications (default: on = critical urgency, never expires, bypasses DND)
+omarchy-mstodo settings persistentReminders false   # off = normal toasts (8–30s)
+omarchy-mstodo settings persistentReminders true    # on = critical, never expires
+
+# Sync interval
+omarchy-mstodo settings syncInterval "15 minutes"
+
+# Reminder lead time
+omarchy-mstodo settings notifyLeadMinutes "5 minutes before"
+
+# Focus timer lengths
+omarchy-mstodo settings focusMinutes 30
+omarchy-mstodo settings shortBreakMinutes 10
+omarchy-mstodo settings longBreakMinutes 20
+omarchy-mstodo settings longBreakInterval 6
+
+# Boolean toggles (accept true/false, on/off, yes/no, 1/0)
+omarchy-mstodo settings autoChain on
+omarchy-mstodo settings pomoNotifications off
+
+# Equivalent native command (no plugin dependency)
+omarchy bar set anishkn.mstodo persistentReminders false
+```
+
+All settings are validated against the manifest schema before writing — enums must match exactly, integers respect min/max/step, booleans accept common forms. The shell hot-reloads on change.
+
 ## Quick-add grammar
 
 Type into the panel's input; a live preview shows what will be created.
