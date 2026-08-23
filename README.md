@@ -171,6 +171,11 @@ reminder's time whenever it falls on the due date.
   panel closed. A lead time of 5/15 minutes is configurable. Reminders that
   were already stale before the session started never re-nag after a reboot;
   each fired reminder is recorded once in `notified.json`.
+- **Persistence**: with *Persistent notifications* on (the default), task
+  reminders and focus toasts stay on screen until dismissed — they survive
+  shell restarts too. Omarchy's daemon implements this via critical urgency,
+  which also bypasses Do Not Disturb; turn the setting off to get regular
+  expiring toasts instead.
 
 ## Sync model
 

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "anishkn.mstodo",
   "name": "MS To Do",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": "anishkn",
   "license": "MIT",
   "description": "Microsoft To Do tasks in your bar — quick-add with times and recurrence, keyboard-driven review, and desktop reminders so nothing slips",
@@ -26,6 +26,7 @@
       "maxTasksPerSection": 8,
       "undoSeconds": 6,
       "notifyLeadMinutes": "At reminder time",
+      "persistentReminders": true,
       "listName": "",
       "focusMinutes": 25,
       "shortBreakMinutes": 5,
@@ -80,6 +81,13 @@
           "15 minutes before"
         ],
         "defaultValue": "At reminder time"
+      },
+      {
+        "key": "persistentReminders",
+        "type": "boolean",
+        "label": "Persistent notifications",
+        "description": "Keep task reminders and focus toasts on screen until you dismiss them. Omarchy implements persistence with critical urgency, which also bypasses Do Not Disturb.",
+        "defaultValue": true
       },
       {
         "key": "listName",
