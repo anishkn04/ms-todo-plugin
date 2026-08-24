@@ -1304,6 +1304,47 @@ class SystemExitWith(Exception):
         self.message = message
 
 
+def _update_cache_after_mutate(task_id: str, method: str, body: dict | None) -> None:
+    """Optimistically update local cache after a successful mutation."""
+    cache = load_json(CACHE_PATH, {}, max_bytes=MAX_CACHE_BYTES) or {}
+    tasks = cache.get("tasks", [])
+    
+    if method == "DELETE":
+        tasks = [t for t in tasks if t.get("id") != task_id]
+    elif method == "PATCH":
+        for t in tasks:
+            if t.get("id") == task_id:
+                if body:
+                    # Apply the patch body to local task
+                    if "status" in body:
+                        if body["status"] == "completed":
+                            t["completed"] = True
+                            t["completedAt"] = time.time()
+                        elif body["status"] == "notStarted":
+                            t["completed"] = False
+                            t["completedAt"] = 0
+                    if "dueDateTime" in body:
+                        # Parse Graph datetime format to epoch
+                        try:
+                            dt = datetime.fromisoformat(body["dueDateTime"]["dateTime"].replace("Z", "+00:00"))
+                            t["due"] = dt.timestamp()
+                        except (ValueError, KeyError):
+                            pass
+                    if "reminderDateTime" in body:
+                        try:
+                            dt = datetime.fromisoformat(body["reminderDateTime"]["dateTime"].replace("Z", "+00:00"))
+                            t["remind"] = dt.timestamp()
+                            t["isReminderOn"] = True
+                        except (ValueError, KeyError):
+                            pass
+                    if "importance" in body:
+                        t["importance"] = body["importance"]
+                break
+    
+    cache["tasks"] = tasks
+    write_cache(**cache)
+
+
 def mutate(method: str, task_id: str, body: dict | None = None) -> int:
     cache = load_json(CACHE_PATH, {}, max_bytes=MAX_CACHE_BYTES) or {}
     list_id = cache.get("listId")
@@ -1329,8 +1370,14 @@ def mutate(method: str, task_id: str, body: dict | None = None) -> int:
     except ApiError as exc:
         print(f"To Do API error: {exc}", file=sys.stderr)
         return 1
-    # The next timer sync picks up server state (including recurring tasks'
-    # newly materialised instances); nothing optimistic to do here.
+    
+    # Optimistically update local cache so UI reflects changes immediately
+    try:
+        _update_cache_after_mutate(task_id, method, body)
+    except Exception as e:
+        # Don't fail the command if cache update fails; next sync will fix it
+        print(f"Warning: cache update failed: {e}", file=sys.stderr)
+    
     return 0
 
 
@@ -1419,11 +1466,17 @@ def _create_or_update(task_id: str | None, line: str) -> int:
     safe_list = urllib.parse.quote(str(list_id), safe="")
     try:
         if task_id:
+            full_id = full_task_id(task_id)
             graph_request(
                 "PATCH",
-                f"/me/todo/lists/{safe_list}/tasks/{urllib.parse.quote(str(task_id), safe='')}",
+                f"/me/todo/lists/{safe_list}/tasks/{urllib.parse.quote(str(full_id), safe='')}",
                 body=body,
             )
+            # Update local cache for updated task
+            try:
+                _update_cache_after_mutate(full_id, "PATCH", body)
+            except Exception as e:
+                print(f"Warning: cache update failed: {e}", file=sys.stderr)
         else:
             created = graph_request(
                 "POST", f"/me/todo/lists/{safe_list}/tasks", body=body,
@@ -1433,6 +1486,17 @@ def _create_or_update(task_id: str | None, line: str) -> int:
                 "title": created.get("title", ""),
                 "recur": label,
             }))
+            # Add new task to local cache
+            try:
+                cache = load_json(CACHE_PATH, {}, max_bytes=MAX_CACHE_BYTES) or {}
+                tasks = cache.get("tasks", [])
+                # Add the newly created task from Graph response
+                new_task = map_task(created)
+                tasks.append(new_task)
+                cache["tasks"] = tasks
+                write_cache(**cache)
+            except Exception as e:
+                print(f"Warning: cache update failed: {e}", file=sys.stderr)
     except AuthRequired:
         write_cache(syncedAt=time.time(), authRequired=True)
         print("Session expired — run 'omarchy-mstodo login'", file=sys.stderr)

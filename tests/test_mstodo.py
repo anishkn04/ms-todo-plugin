@@ -213,7 +213,7 @@ class PayloadMapping(unittest.TestCase):
         self.assertTrue(body.get("isReminderOn"))
         self.assertIn("startDate", body["recurrence"]["range"])
         start = date.fromisoformat(body["recurrence"]["range"]["startDate"])
-        self.assertIn((start - date.today()).days, (0, 1))
+        self.assertIn((start - TODAY).days, (0, 1))
 
     def test_recurring_dateless_task_carries_range_start(self):
         for line in ("bins repeat weekly",
