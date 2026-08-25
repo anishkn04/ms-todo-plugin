@@ -519,12 +519,32 @@ def recur_label(parsed: dict) -> str:
 
 def save_json_atomic(path: str, data) -> None:
     directory = os.path.dirname(path)
+    # Ensure the state directory itself is not a symlink before creating anything
+    # Walk up from the directory to the root, checking each component for symlinks
+    check_dir = directory
+    while True:
+        try:
+            st = os.lstat(check_dir)
+            if stat.S_ISLNK(st.st_mode):
+                raise OSError(40, "refusing to write to symlinked state directory")
+        except OSError as e:
+            # If the error is "No such file" (ENOENT), continue checking parent
+            if e.errno != 2:  # ENOENT
+                raise
+        parent = os.path.dirname(check_dir)
+        if parent == check_dir:
+            break  # Reached root
+        check_dir = parent
+    # Now create the directory (safe to use makedirs since we verified no symlinks in path)
     os.makedirs(directory, exist_ok=True)
     # chmod directory - follow_symlinks=False available in Python 3.6+
     try:
         os.chmod(directory, 0o700, follow_symlinks=False)
-    except (OSError, TypeError):
-        os.chmod(directory, 0o700)
+    except Exception:
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
     tmp = path + ".tmp"
     # Create temp file with 0600 from the start — no race window
     # O_NOFOLLOW prevents following symlinks in the temp path

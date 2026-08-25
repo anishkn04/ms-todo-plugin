@@ -882,13 +882,6 @@ class SecurityHardening(unittest.TestCase):
         self.assertEqual(dir_stat.st_mode & 0o777, 0o700)
 
 
-def test_save_json_atomic_dir_perms_0700(self):
-        path = self.tmpdir / "subdir" / "nested.json"
-        cli.save_json_atomic(str(path), {"key": "value"})
-        dir_stat = os.stat(os.path.dirname(path))
-        self.assertEqual(dir_stat.st_mode & 0o777, 0o700)
-
-
 class SecurityHardening(unittest.TestCase):
     """Security hardening tests for symlink protection, FIFO handling, and atomic writes."""
 
@@ -996,6 +989,27 @@ class SecurityHardening(unittest.TestCase):
         path.symlink_to("/etc/passwd")
         result = cli.load_json(str(path), {"fallback": True}, max_bytes=cli.MAX_CONFIG_BYTES)
         self.assertEqual(result, {"fallback": True})
+
+    def test_save_json_atomic_rejects_symlink_state_dir(self):
+        """Verify save_json_atomic rejects writes when state dir itself is a symlink."""
+        # Create a temp dir and symlink the state dir to it
+        real_state_dir = self.tmpdir / "real_state"
+        real_state_dir.mkdir()
+        symlink_state_dir = self.tmpdir / "symlink_state"
+        symlink_state_dir.symlink_to(real_state_dir)
+        
+        # Patch STATE_DIR to point to the symlink
+        orig_state_dir = cli.STATE_DIR
+        cli.STATE_DIR = str(symlink_state_dir)
+        cli.AUTH_PATH = os.path.join(cli.STATE_DIR, "auth.json")
+        try:
+            with self.assertRaises(OSError) as cm:
+                cli.save_json_atomic(os.path.join(cli.STATE_DIR, "atomic.json"), {"key": "value"})
+            # Should fail because state dir is a symlink
+            self.assertEqual(cm.exception.errno, 40)  # ELOOP
+        finally:
+            cli.STATE_DIR = orig_state_dir
+            cli.AUTH_PATH = os.path.join(cli.STATE_DIR, "auth.json")
 
 
 if __name__ == "__main__":
