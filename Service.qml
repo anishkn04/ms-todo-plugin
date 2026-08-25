@@ -85,10 +85,11 @@ Item {
 
   function boundedRead(path, limit) {
     // Check file is a regular file (not symlink) and use trap to kill process group on timeout
+    // Arguments to sh -c: $0=sh, $1=path, $2=limit
     return ["sh", "-c",
       'trap "kill -TERM -$$" TERM INT EXIT; ' +
-      '[ -f "$1" ] && [ ! -L "$1" ] && head -c "$1" -- "$2" || exit 1',
-      "sh", String(limit), path]
+      '[ -f "$1" ] && [ ! -L "$1" ] && head -c "$2" -- "$1" || exit 1',
+      "sh", path, String(limit)]
   }
 
   FileView {
