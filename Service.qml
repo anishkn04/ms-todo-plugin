@@ -83,15 +83,6 @@ Item {
   readonly property int authReadLimit: 16384    // token blobs are tiny
   readonly property int stateReadLimit: 4096    // notified/pomo maps
 
-  function boundedRead(path, limit) {
-    // Check file is a regular file (not symlink) and use trap to kill process group on timeout
-    // Arguments to sh -c: $0=sh, $1=path, $2=limit
-    return ["sh", "-c",
-      'trap "kill -TERM -$$" TERM INT EXIT; ' +
-      '[ -f "$1" ] && [ ! -L "$1" ] && head -c "$2" -- "$1" || exit 1',
-      "sh", path, String(limit)]
-  }
-
   FileView {
     id: dataWatch
     path: root.statePath + "/data.json"
@@ -111,7 +102,7 @@ Item {
       return
     }
     root.dataReadQueued = false
-    dataReadProc.command = root.boundedRead(root.statePath + "/data.json", root.dataReadLimit)
+    dataReadProc.command = root.cappedCmd(["read-bounded", root.statePath + "/data.json", String(root.dataReadLimit)], "stdout")
     dataReadProc.running = true
   }
 
@@ -162,7 +153,7 @@ Item {
       return
     }
     root.authReadQueued = false
-    authReadProc.command = root.boundedRead(root.statePath + "/auth.json", root.authReadLimit)
+    authReadProc.command = root.cappedCmd(["read-bounded", root.statePath + "/auth.json", String(root.authReadLimit)], "stdout")
     authReadProc.running = true
   }
 
@@ -646,7 +637,7 @@ Item {
 
   function readNotified() {
     if (notifiedReadProc.running) return
-    notifiedReadProc.command = root.boundedRead(root.statePath + "/notified.json", root.stateReadLimit)
+    notifiedReadProc.command = root.cappedCmd(["read-bounded", root.statePath + "/notified.json", String(root.stateReadLimit)], "stdout")
     notifiedReadProc.running = true
   }
 
@@ -710,6 +701,13 @@ Item {
   Process {
     id: notifyProc
     command: ["notify-send", "-a", "To Do"]
+  }
+
+  // Watchdog: notify-send should complete within 3s.
+  Timer {
+    interval: 3000
+    running: notifyProc.running
+    onTriggered: { notifyProc.running = false }
   }
 
   // ---- focus timer --------------------------------------------------------
@@ -811,6 +809,13 @@ Item {
     command: ["notify-send", "-a", "To Do"]
   }
 
+  // Watchdog: notify-send should complete within 3s.
+  Timer {
+    interval: 3000
+    running: pomoNotifyProc.running
+    onTriggered: { pomoNotifyProc.running = false }
+  }
+
   // ---- daily focus stats --------------------------------------------------
 
   // { dateKey: "YYYY-MM-DD", blocks: n, minutes: m } — To Do has nowhere to
@@ -846,7 +851,7 @@ Item {
 
   function readPomo() {
     if (pomoReadProc.running) return
-    pomoReadProc.command = root.boundedRead(root.statePath + "/pomo.json", root.stateReadLimit)
+    pomoReadProc.command = root.cappedCmd(["read-bounded", root.statePath + "/pomo.json", String(root.stateReadLimit)], "stdout")
     pomoReadProc.running = true
   }
 
@@ -873,10 +878,13 @@ Item {
     // to land; the readers re-check once seeding exits. Sync happens via
     // the startup timer above. The plugin only ever touches its own mstodo
     // tree.
-    seedProc.command = ["bash", "-c",
-      "d=\"$HOME/.local/state/omarchy/mstodo\"; mkdir -p \"$d\"; " +
-      "f=\"$d/notified.json\"; [[ -f \"$f\" ]] || printf '{}' > \"$f\"; " +
-      "f=\"$d/pomo.json\"; [[ -f \"$f\" ]] || printf '{ \"dateKey\": \"\", \"blocks\": 0, \"minutes\": 0 }' > \"$f\""]
+    var notifiedContent = JSON.stringify({});
+    var pomoContent = JSON.stringify({dateKey: "", blocks: 0, minutes: 0});
+    seedProc.command = root.cappedCmd([
+      "seed-create",
+      root.statePath + "/notified.json:" + notifiedContent,
+      root.statePath + "/pomo.json:" + pomoContent
+    ], "stderr")
     seedProc.running = true
   }
 

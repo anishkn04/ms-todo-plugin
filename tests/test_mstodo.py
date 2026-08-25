@@ -587,10 +587,12 @@ class AuthRefreshMapping(unittest.TestCase):
         cli.set_authority("common")
         self._orig_request = cli.oauth_token_request
         self._orig_save = cli.save_json_atomic
+        self._orig_load_tokens = cli.load_tokens
 
     def tearDown(self):
         cli.oauth_token_request = self._orig_request
         cli.save_json_atomic = self._orig_save
+        cli.load_tokens = self._orig_load_tokens
 
     def _expired_tokens(self):
         return {"refresh_token": "rt", "access_token": "at", "expires_at": 0}
@@ -601,12 +603,14 @@ class AuthRefreshMapping(unittest.TestCase):
             with self.subTest(err=err):
                 cli.oauth_token_request = lambda fields, e=err: (
                     (_ for _ in ()).throw(cli.ApiError(f"{e}: token expired")))
+                cli.load_tokens = lambda: self._expired_tokens()
                 with self.assertRaises(cli.AuthRequired):
                     cli.access_token(self._expired_tokens())
 
     def test_transient_api_error_stays_api_error(self):
         cli.oauth_token_request = lambda fields: (
             (_ for _ in ()).throw(cli.ApiError("temporarily_unavailable")))
+        cli.load_tokens = lambda: self._expired_tokens()
         with self.assertRaises(cli.ApiError) as ctx:
             cli.access_token(self._expired_tokens())
         self.assertNotIsInstance(ctx.exception, cli.AuthRequired)
@@ -616,6 +620,7 @@ class AuthRefreshMapping(unittest.TestCase):
         cli.save_json_atomic = lambda path, data: saved.update(path=path)
         cli.oauth_token_request = lambda fields: {
             "access_token": "fresh", "refresh_token": "rt2", "expires_in": 3600}
+        cli.load_tokens = lambda: self._expired_tokens()
         token = cli.access_token(self._expired_tokens())
         self.assertEqual(token, "fresh")
         self.assertIn("auth.json", str(saved.get("path")))
@@ -710,14 +715,14 @@ class MalformedResponses(unittest.TestCase):
             return False
 
     def tearDown(self):
-        if hasattr(self, "_orig_urlopen"):
-            cli.urllib.request.urlopen = self._orig_urlopen
+        if hasattr(self, "_orig_urlopen_no_proxy"):
+            cli._urlopen_no_proxy = self._orig_urlopen_no_proxy
         if hasattr(self, "_orig_load_tokens"):
             cli.load_tokens = self._orig_load_tokens
 
     def _serve_body(self, payload):
-        self._orig_urlopen = cli.urllib.request.urlopen
-        cli.urllib.request.urlopen = lambda req, timeout=None: type(self).FakeCtx(payload)
+        self._orig_urlopen_no_proxy = cli._urlopen_no_proxy
+        cli._urlopen_no_proxy = lambda req, timeout=None: type(self).FakeCtx(payload)
         # A live token so access_token() short-circuits and the request
         # actually reaches urlopen.
         self._orig_load_tokens = cli.load_tokens
@@ -791,7 +796,7 @@ class MapTaskTimezones(unittest.TestCase):
         self.assertEqual(dt.hour, 12)
 
 
-class SecurityHardening(unittest.TestCase):
+class SecurityHardeningIO(unittest.TestCase):
     """Tests for the security hardening: bounded reads, atomic writes, caps."""
 
     def setUp(self):
@@ -882,7 +887,7 @@ class SecurityHardening(unittest.TestCase):
         self.assertEqual(dir_stat.st_mode & 0o777, 0o700)
 
 
-class SecurityHardening(unittest.TestCase):
+class SecurityHardeningSymlinks(unittest.TestCase):
     """Security hardening tests for symlink protection, FIFO handling, and atomic writes."""
 
     def setUp(self):
@@ -951,7 +956,7 @@ class SecurityHardening(unittest.TestCase):
             self.assertEqual(result.stdout, "hello world this is ")
             self.assertEqual(len(result.stdout), 20)
 
-    def test_load_json_rejects_symlink(self):
+    def test_load_json_rejects_symlink_cache(self):
         # Create symlink for cache file, verify fallback used
         path = self.tmpdir / "cache.json"
         path.symlink_to("/etc/passwd")
@@ -983,7 +988,7 @@ class SecurityHardening(unittest.TestCase):
         # Should fail with ELOOP (symlink detected) or EEXIST (file exists)
         self.assertIn(cm.exception.errno, (17, 40))
 
-    def test_load_json_rejects_symlink(self):
+    def test_load_json_rejects_symlink_config(self):
         # Create symlink for any state file, verify fallback used
         path = self.tmpdir / "config.json"
         path.symlink_to("/etc/passwd")

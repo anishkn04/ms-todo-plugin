@@ -38,6 +38,8 @@ Commands:
   snooze TASK_ID WHEN         move due + reminder (@HH:MM, @tomorrow, ...)
   delete TASK_ID              delete a task
   settings [KEY [VALUE]]      show or set plugin settings (wraps omarchy bar set)
+  read-bounded PATH MAX       read file with size limit & symlink protection (internal)
+  seed-create PATH:JSON ...   create state files atomically if missing (internal)
 
 TASK_ID accepts the short id suffix shown by `list` when it is unique.
 
@@ -64,6 +66,7 @@ Settings (via `omarchy-mstodo settings` or `omarchy bar set anishkn.mstodo`):
 """
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -154,12 +157,84 @@ def _read_file_bounded(path: str, max_bytes: int) -> str:
         raise FileReadTimeout(f"read failed: {e}")
 
 
+def cmd_read_bounded(args) -> int:
+    """Read at most max_bytes from path with timeout; print to stdout on success.
+    Exits non-zero with stderr message on error (matches other subcommand style)."""
+    try:
+        content = _read_file_bounded(args.path, args.max_bytes)
+        sys.stdout.write(content)
+        return 0
+    except FileReadLimitExceeded as e:
+        print(f"read-bounded: {e}", file=sys.stderr)
+        return 1
+    except FileReadTimeout as e:
+        print(f"read-bounded: {e}", file=sys.stderr)
+        return 1
+    except OSError as e:
+        if e.errno == 2:  # ENOENT
+            print(f"read-bounded: file not found", file=sys.stderr)
+        else:
+            print(f"read-bounded: {e}", file=sys.stderr)
+        return 1
+
+
+def cmd_seed_create(args) -> int:
+    """Create state files atomically if missing (notified.json, pomo.json).
+    Uses O_CREAT|O_EXCL|O_NOFOLLOW to avoid TOCTOU races.
+    Arguments are PATH:CONTENT pairs where CONTENT is JSON."""
+    try:
+        for item in args.files:
+            # Split on first colon only, in case JSON content contains colons
+            path, _, default_content = item.partition(":")
+            if not path or not default_content:
+                print(f"seed-create: invalid argument '{item}' (expected PATH:JSON)", file=sys.stderr)
+                return 2
+            # Validate that content is valid JSON
+            try:
+                json.loads(default_content)
+            except json.JSONDecodeError:
+                print(f"seed-create: invalid JSON content for {path}", file=sys.stderr)
+                return 2
+            # Ensure parent directory exists with 0700
+            directory = os.path.dirname(path)
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            try:
+                os.chmod(directory, 0o700, follow_symlinks=False)
+            except Exception:
+                try:
+                    os.chmod(directory, 0o700)
+                except OSError:
+                    pass
+            # Open with O_CREAT|O_EXCL|O_NOFOLLOW for atomic create-if-missing
+            try:
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+            except FileExistsError:
+                continue  # already exists, no-op
+            except OSError as e:
+                if e.errno == 40:  # ELOOP - symlink detected
+                    print(f"seed-create: {path}: symlinks not allowed", file=sys.stderr)
+                    return 1
+                raise
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(default_content)
+            finally:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        return 0
+    except OSError as e:
+        print(f"seed-create: {e}", file=sys.stderr)
+        return 1
+
+
 def load_json(path: str, fallback, *, max_bytes: int = MAX_CONFIG_BYTES):
     """Load JSON from a bounded, timeout-protected file read."""
     try:
         raw = _read_file_bounded(path, max_bytes)
         return json.loads(raw)
-    except (OSError, ValueError, FileReadTimeout, FileReadLimitExceeded):
+    except (OSError, ValueError, RecursionError, FileReadTimeout, FileReadLimitExceeded):
         return fallback
 
 
@@ -195,6 +270,7 @@ AUTH_PATH = os.path.join(STATE_DIR, "auth.json")
 CACHE_PATH = os.path.join(STATE_DIR, "data.json")
 CONFIG_PATH = os.path.join(STATE_DIR, "config.json")
 LOGIN_PATH = os.path.join(STATE_DIR, "login.json")
+LOCK_PATH = os.path.join(STATE_DIR, "lock")
 
 
 MAX_TASKS_FETCH = 250
@@ -234,6 +310,13 @@ def read_body_limited(resp, limit: int = MAX_RESPONSE_BYTES) -> str:
     if len(data) > limit:
         raise ApiError(f"response body exceeded {limit} bytes")
     return data.decode()
+
+
+def _urlopen_no_proxy(req, timeout: int = HTTP_TIMEOUT):
+    """Open URL with an opener that ignores environment proxy settings.
+    Uses ProxyHandler({}) to bypass HTTP_PROXY/HTTPS_PROXY/ALL_PROXY."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return opener.open(req, timeout=timeout)
 
 
 class AuthRequired(Exception):
@@ -536,7 +619,7 @@ def save_json_atomic(path: str, data) -> None:
             break  # Reached root
         check_dir = parent
     # Now create the directory (safe to use makedirs since we verified no symlinks in path)
-    os.makedirs(directory, exist_ok=True)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
     # chmod directory - follow_symlinks=False available in Python 3.6+
     try:
         os.chmod(directory, 0o700, follow_symlinks=False)
@@ -581,6 +664,29 @@ def safe_unlink(path: str) -> None:
         pass
 
 
+@contextmanager
+def _state_lock():
+    """Advisory lock on the state directory for cross-process coordination.
+    Held only around critical sections (token refresh, cache writes).
+    Best-effort: if locking fails, proceed without it (reliability, not security)."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    lock_fd = os.open(LOCK_PATH, os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    except OSError:
+        # Locking failed (e.g., NFS, unusual FS); proceed without lock
+        yield
+    finally:
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
+
+
 def client_id(tokens: dict) -> str:
     return (
         os.environ.get("OMARCHY_MSTODO_CLIENT_ID")
@@ -600,27 +706,33 @@ def access_token(tokens: dict) -> str:
     if tokens.get("access_token") and time.time() < tokens.get("expires_at", 0) - 120:
         return tokens["access_token"]
     set_authority(tokens.get("authority", "common"))
-    try:
-        refreshed = oauth_token_request({
-            "client_id": client_id(tokens),
-            "grant_type": "refresh_token",
-            "refresh_token": tokens["refresh_token"],
-            "scope": SCOPES,
-        })
-    except ApiError as exc:
-        # A refused refresh (revoked grant, password change, tenant policy)
-        # is a sign-in state, not a transient API failure. Without this
-        # mapping the cache keeps claiming a live session the UI trusts.
-        if any(code in str(exc) for code in (
-            "invalid_grant", "interaction_required",
-            "consent_required", "unauthorized_client",
-        )):
-            raise AuthRequired("session expired — run 'omarchy-mstodo login'") from exc
-        raise
-    merged = {**tokens, **refreshed}
-    merged["expires_at"] = time.time() + refreshed.get("expires_in", 3600)
-    save_json_atomic(AUTH_PATH, merged)
-    return merged["access_token"]
+    # Hold lock across refresh + save to prevent concurrent refresh races
+    with _state_lock():
+        # Re-check under lock in case another process already refreshed
+        tokens = load_tokens()
+        if tokens.get("access_token") and time.time() < tokens.get("expires_at", 0) - 120:
+            return tokens["access_token"]
+        try:
+            refreshed = oauth_token_request({
+                "client_id": client_id(tokens),
+                "grant_type": "refresh_token",
+                "refresh_token": tokens["refresh_token"],
+                "scope": SCOPES,
+            })
+        except ApiError as exc:
+            # A refused refresh (revoked grant, password change, tenant policy)
+            # is a sign-in state, not a transient API failure. Without this
+            # mapping the cache keeps claiming a live session the UI trusts.
+            if any(code in str(exc) for code in (
+                "invalid_grant", "interaction_required",
+                "consent_required", "unauthorized_client",
+            )):
+                raise AuthRequired("session expired — run 'omarchy-mstodo login'") from exc
+            raise
+        merged = {**tokens, **refreshed}
+        merged["expires_at"] = time.time() + refreshed.get("expires_in", 3600)
+        save_json_atomic(AUTH_PATH, merged)
+        return merged["access_token"]
 
 
 def http_form(url: str, fields: dict) -> dict:
@@ -631,7 +743,7 @@ def http_form(url: str, fields: dict) -> dict:
     })
     try:
         with request_timeout():
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            with _urlopen_no_proxy(req, timeout=HTTP_TIMEOUT) as resp:
                 raw = read_body_limited(resp)
                 return json.loads(raw)
     except urllib.error.HTTPError as exc:
@@ -641,9 +753,10 @@ def http_form(url: str, fields: dict) -> dict:
             payload = {}
         error = payload.get("error", f"HTTP {exc.code}")
         raise ApiError(f"{error}: {payload.get('error_description', '')[:300]}") from exc
-    except ValueError as exc:
-        # UnicodeDecodeError is a ValueError; both mean the body lied about
-        # being JSON. Keep it a NetworkError so callers retry instead of
+    except (ValueError, RecursionError) as exc:
+        # UnicodeDecodeError is a ValueError; RecursionError is a RuntimeError
+        # subclass from deeply nested JSON. Both mean the body lied about
+        # being valid JSON. Keep it a NetworkError so callers retry instead of
         # dying on a traceback.
         raise NetworkError(f"malformed token response: {str(exc)[:120]}") from exc
     except (urllib.error.URLError, OSError) as exc:
@@ -889,7 +1002,7 @@ def graph_request(method: str, path: str, body: dict | None = None, params: dict
     })
     try:
         with request_timeout():
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            with _urlopen_no_proxy(req, timeout=HTTP_TIMEOUT) as resp:
                 raw = read_body_limited(resp)
                 return json.loads(raw) if raw.strip() else {}
     except urllib.error.HTTPError as exc:
@@ -909,7 +1022,7 @@ def graph_request(method: str, path: str, body: dict | None = None, params: dict
             retry_after = exc.headers.get("Retry-After", "10")
             raise ApiError(f"rate limited, retry after {retry_after}s") from exc
         raise ApiError(message[:300]) from exc
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise NetworkError(f"malformed response body: {str(exc)[:120]}") from exc
     except (urllib.error.URLError, OSError) as exc:
         raise NetworkError(str(exc)) from exc
@@ -996,9 +1109,10 @@ def map_task(raw: dict) -> dict:
 # sync / status
 
 def write_cache(**fields) -> None:
-    cache = load_json(CACHE_PATH, {}, max_bytes=MAX_CACHE_BYTES) or {}
-    cache.update(fields)
-    save_json_atomic(CACHE_PATH, cache)
+    with _state_lock():
+        cache = load_json(CACHE_PATH, {}, max_bytes=MAX_CACHE_BYTES) or {}
+        cache.update(fields)
+        save_json_atomic(CACHE_PATH, cache)
 
 
 def read_config() -> dict:
@@ -1623,12 +1737,21 @@ def main(argv: list[str]) -> int:
     p_settings.add_argument("key", nargs="?", default=None, help="setting name")
     p_settings.add_argument("value", nargs="?", default=None, help="new value")
 
+    p_read_bounded = sub.add_parser("read-bounded", help="read file with size limit and symlink protection (internal)")
+    p_read_bounded.add_argument("path")
+    p_read_bounded.add_argument("max_bytes", type=int)
+
+    p_seed_create = sub.add_parser("seed-create", help="create state files atomically if missing (internal)")
+    p_seed_create.add_argument("files", nargs="+", metavar="PATH:CONTENT",
+                               help="path:default_content pairs (content is JSON)")
+
     args = parser.parse_args(argv)
     handlers = {
         "login": cmd_login, "logout": cmd_logout, "sync": cmd_sync, "status": cmd_status,
         "list": cmd_list, "settings": cmd_settings,
         "add": cmd_add, "update": cmd_update, "complete": cmd_complete,
         "uncomplete": cmd_uncomplete, "delete": cmd_delete, "snooze": cmd_snooze,
+        "read-bounded": cmd_read_bounded, "seed-create": cmd_seed_create,
     }
     if args.command not in handlers:
         parser.print_help()

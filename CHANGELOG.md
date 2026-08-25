@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.3.2 — 2026-08-25
+
+Security hardening and test suite fixes (follow-up).
+
+- TOCTOU fixes: QML `boundedRead()` replaced with CLI `read-bounded` subcommand
+  (single `os.open` + `fstat` + `read` on same fd, no reopen race); `seedProc`
+  replaced with CLI `seed-create` subcommand (atomic `O_CREAT|O_EXCL|O_NOFOLLOW`).
+  Both now create state files at 0600 for consistency.
+- Unhandled `RecursionError` on deeply-nested JSON: catch `RecursionError`
+  alongside `ValueError` in `graph_request`, `http_form`, `load_json`.
+- Implicit proxy trust removed: all Graph/login calls use `ProxyHandler({})`
+  opener to ignore `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` environment variables.
+- Cross-process advisory locking: `fcntl.flock` on dedicated lock file held
+  around token refresh and cache write critical sections.
+- Test suite integrity: renamed duplicate `SecurityHardening` classes to
+  `SecurityHardeningIO` / `SecurityHardeningSymlinks`; renamed duplicate
+  `test_load_json_rejects_symlink` methods to distinct names; both test sets
+  now run. Corrected false claim in 0.3.1 entry.
+- Momentary non-0700 window on first state-dir creation narrowed: `os.makedirs`
+  now uses `mode=0o700` directly (belt-and-suspenders with existing chmod).
+- Watchdog timers added for `notifyProc` and `pomoNotifyProc` (3s each).
+
 ## 0.3.1 — 2026-08-25
 
 Security hardening and test suite fixes.
@@ -7,10 +29,9 @@ Security hardening and test suite fixes.
 - State directory symlink protection: `save_json_atomic` now walks up the
   directory tree with `lstat` and refuses to write if any component is a
   symlink, closing the last path-traversal vector.
-- Test suite integrity: merged duplicate `SecurityHardening` class that
-  silently shadowed 9 tests; removed orphaned duplicate test; added
-  `test_bounded_read_argument_order` and `test_save_json_atomic_rejects_symlink_state_dir`
-  regression tests.
+- Test suite: added `test_bounded_read_argument_order` and
+  `test_save_json_atomic_rejects_symlink_state_dir` regression tests.
+  (Note: the duplicate `SecurityHardening` class fix is in 0.3.2.)
 - All file reads now use `O_NOFOLLOW` + `S_ISREG` checks; temp files use
   `O_EXCL|O_NOFOLLOW`; directory operations use `follow_symlinks=False`.
 - Process watchdogs now use `trap "kill -TERM -$$"` to kill entire process
