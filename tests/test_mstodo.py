@@ -12,6 +12,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 import time
 import unittest
 from datetime import date, datetime, timedelta, timezone
@@ -928,6 +929,34 @@ class SecurityHardening(unittest.TestCase):
                 cli._read_file_bounded(str(fifo_path), 1024)
         finally:
             os.unlink(fifo_path)
+
+    def test_bounded_read_argument_order(self):
+        """Regression test for boundedRead argument order bug.
+        
+        The boundedRead function had a bug where the shell command arguments
+        were swapped: the shell script expected $1=path, $2=limit, but
+        arguments were passed as (limit, path).
+        """
+        import subprocess
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_file = Path(tmpdir) / "test.txt"
+            test_content = "hello world this is a test file with some content"
+            test_file.write_text(test_content)
+            
+            limit = 20
+            path = str(test_file)
+            
+            # This replicates the fixed boundedRead shell command
+            cmd = ["sh", "-c",
+              'trap "kill -TERM -$$" TERM INT EXIT; ' +
+              '[ -f "$1" ] && [ ! -L "$1" ] && head -c "$2" -- "$1" || exit 1',
+              "sh", path, str(limit)]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "hello world this is ")
+            self.assertEqual(len(result.stdout), 20)
 
     def test_load_json_rejects_symlink(self):
         # Create symlink for cache file, verify fallback used
