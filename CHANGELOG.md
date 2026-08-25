@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.1 — 2026-08-25
+
+Security hardening and test suite fixes.
+
+- State directory symlink protection: `save_json_atomic` now walks up the
+  directory tree with `lstat` and refuses to write if any component is a
+  symlink, closing the last path-traversal vector.
+- Test suite integrity: merged duplicate `SecurityHardening` class that
+  silently shadowed 9 tests; removed orphaned duplicate test; added
+  `test_bounded_read_argument_order` and `test_save_json_atomic_rejects_symlink_state_dir`
+  regression tests.
+- All file reads now use `O_NOFOLLOW` + `S_ISREG` checks; temp files use
+  `O_EXCL|O_NOFOLLOW`; directory operations use `follow_symlinks=False`.
+- Process watchdogs now use `trap "kill -TERM -$$"` to kill entire process
+  groups, preventing FIFO/special-file stalls from pinning the shell.
+- Device code passed to `wl-copy` via stdin instead of argv to avoid
+  leakage in process table.
+
 ## 0.3.0 — 2026-08-23
 
 Bounded state IO and persistent notifications.
