@@ -881,6 +881,94 @@ class SecurityHardening(unittest.TestCase):
         self.assertEqual(dir_stat.st_mode & 0o777, 0o700)
 
 
+def test_save_json_atomic_dir_perms_0700(self):
+        path = self.tmpdir / "subdir" / "nested.json"
+        cli.save_json_atomic(str(path), {"key": "value"})
+        dir_stat = os.stat(os.path.dirname(path))
+        self.assertEqual(dir_stat.st_mode & 0o777, 0o700)
+
+
+class SecurityHardening(unittest.TestCase):
+    """Security hardening tests for symlink protection, FIFO handling, and atomic writes."""
+
+    def setUp(self):
+        self.tmpdir = Path("/tmp/omarchy_test").resolve()
+        self.tmpdir.mkdir(exist_ok=True)
+        # Patch STATE_DIR for isolation
+        self._orig_state_dir = cli.STATE_DIR
+        cli.STATE_DIR = str(self.tmpdir)
+        cli.AUTH_PATH = os.path.join(cli.STATE_DIR, "auth.json")
+        cli.CACHE_PATH = os.path.join(cli.STATE_DIR, "data.json")
+        cli.CONFIG_PATH = os.path.join(cli.STATE_DIR, "config.json")
+        cli.LOGIN_PATH = os.path.join(cli.STATE_DIR, "login.json")
+
+    def tearDown(self):
+        cli.STATE_DIR = self._orig_state_dir
+        cli.AUTH_PATH = os.path.join(cli.STATE_DIR, "auth.json")
+        cli.CACHE_PATH = os.path.join(cli.STATE_DIR, "data.json")
+        cli.CONFIG_PATH = os.path.join(cli.STATE_DIR, "config.json")
+        cli.LOGIN_PATH = os.path.join(cli.STATE_DIR, "login.json")
+        # Clean up temp dir
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_read_file_bounded_rejects_symlink(self):
+        # Create symlink to /etc/passwd, verify read fails with FileReadLimitExceeded
+        path = self.tmpdir / "link.json"
+        path.symlink_to("/etc/passwd")
+        with self.assertRaises(cli.FileReadLimitExceeded):
+            cli._read_file_bounded(str(path), 1024)
+
+    def test_read_file_bounded_rejects_fifo(self):
+        # Create FIFO and ensure read times out
+        fifo_path = self.tmpdir / "test_fifo"
+        os.mkfifo(fifo_path)
+        try:
+            with self.assertRaises(cli.FileReadTimeout):
+                cli._read_file_bounded(str(fifo_path), 1024)
+        finally:
+            os.unlink(fifo_path)
+
+    def test_load_json_rejects_symlink(self):
+        # Create symlink for cache file, verify fallback used
+        path = self.tmpdir / "cache.json"
+        path.symlink_to("/etc/passwd")
+        result = cli.load_json(str(path), {"fallback": True}, max_bytes=cli.MAX_CACHE_BYTES)
+        self.assertEqual(result, {"fallback": True})
+
+    def test_load_json_rejects_symlink_manifest(self):
+        # Symlink manifest.json, verify fallback
+        path = self.tmpdir / "manifest.json"
+        path.symlink_to("/etc/passwd")
+        result = cli.load_json(str(path), {"fallback": True}, max_bytes=cli.MAX_MANIFEST_BYTES)
+        self.assertEqual(result, {"fallback": True})
+
+    def test_load_json_rejects_symlink_shell_json(self):
+        # Symlink shell.json, verify fallback
+        path = self.tmpdir / "shell.json"
+        path.symlink_to("/etc/passwd")
+        result = cli.load_json(str(path), {"fallback": True}, max_bytes=cli.MAX_SHELL_JSON_BYTES)
+        self.assertEqual(result, {"fallback": True})
+
+    def test_save_json_atomic_rejects_symlink_temp(self):
+        # Create symlink as temp file target, verify write fails with ELOOP or EEXIST
+        path = self.tmpdir / "atomic.json"
+        # Create a symlink where the temp file would be created
+        tmp_path = Path(str(path) + ".tmp")
+        tmp_path.symlink_to("/etc/passwd")
+        with self.assertRaises(OSError) as cm:
+            cli.save_json_atomic(str(path), {"key": "value"})
+        # Should fail with ELOOP (symlink detected) or EEXIST (file exists)
+        self.assertIn(cm.exception.errno, (17, 40))
+
+    def test_load_json_rejects_symlink(self):
+        # Create symlink for any state file, verify fallback used
+        path = self.tmpdir / "config.json"
+        path.symlink_to("/etc/passwd")
+        result = cli.load_json(str(path), {"fallback": True}, max_bytes=cli.MAX_CONFIG_BYTES)
+        self.assertEqual(result, {"fallback": True})
+
+
 if __name__ == "__main__":
     print(json.dumps({"suite": "omarchy-mstodo", "bin": str(BIN), "exists": BIN.exists()}))
     unittest.main(verbosity=2)

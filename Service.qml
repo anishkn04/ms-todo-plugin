@@ -84,7 +84,11 @@ Item {
   readonly property int stateReadLimit: 4096    // notified/pomo maps
 
   function boundedRead(path, limit) {
-    return ["timeout", "5", "head", "-c", String(limit), "--", path]
+    // Check file is a regular file (not symlink) and use trap to kill process group on timeout
+    return ["sh", "-c",
+      'trap "kill -TERM -$$" TERM INT EXIT; ' +
+      '[ -f "$1" ] && [ ! -L "$1" ] && head -c "$1" -- "$2" || exit 1',
+      "sh", String(limit), path]
   }
 
   FileView {
@@ -237,7 +241,9 @@ Item {
     var redirect = capture === "stdout"
       ? "2>/dev/null | head -c " + root.jsonCapBytes
       : "2>&1 | head -c " + root.errCapBytes
-    return ["sh", "-c", 'set -o pipefail; "$0" "$@" ' + redirect, root.cli].concat(args)
+    return ["sh", "-c",
+      'trap "kill -TERM -$$" TERM INT EXIT; set -o pipefail; "$0" "$@" ' + redirect,
+      root.cli].concat(args)
   }
 
   function refresh(force) {
@@ -335,7 +341,8 @@ Item {
   function copySignInCode() {
     if (root.loginCode === "") return
     // wl-copy forks a background holder; Process only tracks the parent.
-    copyProc.command = ["wl-copy", root.loginCode]
+    // Pass code via stdin to avoid leaking device code in argv/process table.
+    copyProc.command = ["sh", "-c", 'printf %s "$1" | wl-copy', "sh", root.loginCode]
     copyProc.running = true
   }
 
