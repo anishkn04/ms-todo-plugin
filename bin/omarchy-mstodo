@@ -1717,22 +1717,36 @@ def main(argv: list[str]) -> int:
     sub = parser.add_subparsers(dest="command", metavar="<command>")
 
     p_login = sub.add_parser("login", help="authenticate via microsoft.com/link",
-                             description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+                             description="Device-code flow authentication.\n\n"
+                                         "  omarchy-mstodo login          interactive flow (prints code, opens browser, polls)\n"
+                                         "  omarchy-mstodo login start    machine step: request device code, print JSON\n"
+                                         "  omarchy-mstodo login poll     machine step: one poll against pending sign-in\n"
+                                         "  omarchy-mstodo login cancel   machine step: abort pending sign-in",
+                             formatter_class=argparse.RawDescriptionHelpFormatter)
     p_login.add_argument("step", nargs="?", choices=["start", "poll", "cancel"], default=None,
                          help="machine steps: start prints the code as JSON, poll checks once, cancel aborts")
+
     sub.add_parser("logout", help="forget stored tokens",
-                   description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+                   description="Remove saved OAuth tokens and pending login state.",
+                   formatter_class=argparse.RawDescriptionHelpFormatter)
 
     p_sync = sub.add_parser("sync", help="refresh the on-disk cache",
-                            description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+                            description="Fetch tasks from Microsoft Graph and update local cache.\n\n"
+                                        "  --max-age SEC  skip network if cache is younger than SEC seconds",
+                            formatter_class=argparse.RawDescriptionHelpFormatter)
     p_sync.add_argument("--max-age", type=float, default=None, metavar="SEC",
                         help="skip network when the cache is younger than SEC seconds")
 
     sub.add_parser("status", help="print the cache summary as JSON",
-                   description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+                   description="Print the current cache (syncedAt, authRequired, account, listName, tasks).",
+                   formatter_class=argparse.RawDescriptionHelpFormatter)
 
     p_list = sub.add_parser("list", help="list tasks from the cache",
-                            description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+                            description="List cached tasks grouped by time.\n\n"
+                                        "SCOPE: (default) open tasks grouped | overdue | today | upcoming | all | done\n"
+                                        "  -a, --all-done  include completed tasks\n"
+                                        "  --json          machine-readable output",
+                            formatter_class=argparse.RawDescriptionHelpFormatter)
     p_list.add_argument("scope", nargs="?", default="",
                         choices=["", "overdue", "today", "upcoming", "all", "done"],
                         help="filter (default: open tasks grouped)")
@@ -1741,11 +1755,19 @@ def main(argv: list[str]) -> int:
     p_list.add_argument("--json", action="store_true", help="machine-readable output")
 
     p_add = sub.add_parser("add", help="create a task from the quick-add grammar",
-                           description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+                           description="Quick-add grammar (all parts optional, order free):\n"
+                                       "  TITLE @today|@tomorrow|@mon..@sun|@DD|@DD.MM [HH:MM]\n"
+                                       "        [repeat daily|weekdays|weekly|monthly|yearly|every N days|after-completion [until DD.MM]]\n"
+                                       "        [!low|!normal|!high]",
+                           formatter_class=argparse.RawDescriptionHelpFormatter)
     p_add.add_argument("line")
 
     p_update = sub.add_parser("update", help="rewrite an existing task from the grammar",
-                              description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+                              description="Quick-add grammar (all parts optional, order free):\n"
+                                          "  TITLE @today|@tomorrow|@mon..@sun|@DD|@DD.MM [HH:MM]\n"
+                                          "        [repeat daily|weekdays|weekly|monthly|yearly|every N days|after-completion [until DD.MM]]\n"
+                                          "        [!low|!normal|!high]",
+                              formatter_class=argparse.RawDescriptionHelpFormatter)
     p_update.add_argument("task_id")
     p_update.add_argument("line")
 
@@ -1755,16 +1777,27 @@ def main(argv: list[str]) -> int:
         ("delete", cmd_delete, "delete a task"),
     ):
         p = sub.add_parser(name, help=help_text,
-                           description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+                           description="TASK_ID accepts the short id suffix shown by `list` when unique.",
+                           formatter_class=argparse.RawDescriptionHelpFormatter)
         p.add_argument("task_id")
 
     p_snooze = sub.add_parser("snooze", help="move due + reminder of a task",
-                              description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+                              description="Reschedule a task's due date and reminder.\n"
+                                          "WHEN examples: @tomorrow 09:00 | @+1h | @+2d | @fri 10:00",
+                              formatter_class=argparse.RawDescriptionHelpFormatter)
     p_snooze.add_argument("task_id")
     p_snooze.add_argument("when", nargs="+", metavar="@WHEN")
 
     p_settings = sub.add_parser("settings", help="show or set plugin settings",
-                                description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+                                description="Show or set plugin settings (wraps omarchy bar set).\n\n"
+                                            "  omarchy-mstodo settings              show all settings\n"
+                                            "  omarchy-mstodo settings KEY          show single setting\n"
+                                            "  omarchy-mstodo settings KEY VALUE    set setting\n\n"
+                                            "Settings: persistentReminders, syncInterval, notifyLeadMinutes,\n"
+                                            "  undoSeconds, focusMinutes, shortBreakMinutes, longBreakMinutes,\n"
+                                            "  longBreakInterval, autoChain, pomoNotifications,\n"
+                                            "  maxTasksPerSection, listName, minBarWidth",
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     p_settings.add_argument("key", nargs="?", default=None, help="setting name")
     p_settings.add_argument("value", nargs="?", default=None, help="new value")
 
