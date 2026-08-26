@@ -4,6 +4,105 @@ import qs.Commons
 import qs.Ui
 import "Model.js" as Model
 
+// Marquee text: scrolls left->right->left when content exceeds available width.
+// Pauses at ends for readability. Only activates when text wider than clip.
+Item {
+  id: marqueeText
+  property string text: ""
+  property int fontPixelSize: Style.font.body
+  property string fontFamily: Style.font.family
+  property color color: Color.popups.text
+  property bool enabled: true
+  property int pauseMs: 2000
+  property int speedPxPerSec: 50
+
+  implicitWidth: clipItem.width
+  implicitHeight: clipItem.height
+
+  // Internal state
+  property real _offset: 0
+  property int _singleWidth: 0
+  property int _clipWidth: 0
+  property bool _scrolling: false
+  property bool _atEndPause: false
+  property int _pauseTimer: 0
+  property string _fullText: ""
+
+  Clip {
+    id: clipItem
+    anchors.fill: parent
+    Text {
+      id: textItem
+      text: ""
+      font.pixelSize: marqueeText.fontPixelSize
+      font.family: marqueeText.fontFamily
+      color: marqueeText.color
+    }
+  }
+
+  function updateText(newText) {
+    _fullText = newText
+    _clipWidth = clipItem.width
+    if (!_clipWidth || _clipWidth <= 0) return
+
+    // Measure single copy width
+    textItem.text = newText
+    _singleWidth = textItem.advanceWidth
+
+    if (_singleWidth <= _clipWidth || !marqueeText.enabled) {
+      _scrolling = false
+      _atEndPause = false
+      _pauseTimer = 0
+      scrollTimer.running = false
+      textItem.x = 0
+      textItem.text = newText
+      return
+    }
+
+    // Text is wider: render two copies side by side for seamless loop
+    _scrolling = true
+    _atEndPause = true
+    _pauseTimer = 0
+    _offset = 0
+    textItem.text = newText + "        " + newText  // 8-char gap
+    scrollTimer.running = true
+  }
+
+  Timer {
+    id: scrollTimer
+    interval: 16  // ~60fps
+    running: false
+    repeat: true
+    onTriggered: {
+      if (!_scrolling || _singleWidth <= _clipWidth) return
+      var gap = 8 * (textItem.font.pixelSize / 12)  // scale gap with font
+      var loopWidth = _singleWidth + gap
+      var step = marqueeText.speedPxPerSec * (16 / 1000)
+
+      if (_atEndPause) {
+        _pauseTimer += 16
+        if (_pauseTimer >= marqueeText.pauseMs) {
+          _atEndPause = false
+          _pauseTimer = 0
+        }
+        return
+      }
+
+      _offset += step
+      if (_offset >= loopWidth) {
+        _offset -= loopWidth
+        _atEndPause = true
+        _pauseTimer = 0
+      }
+      textItem.x = -_offset
+    }
+  }
+
+  // Re-measure on width/clip changes
+  onWidthChanged: if (_fullText) updateText(_fullText)
+  onHeightChanged: if (_fullText) updateText(_fullText)
+}
+
 // Bar slot for MS To Do. The service owns the cache and the timers; this
 // reads already-shaped state off it so the line stays live whether or not
 // the panel has ever been opened.
@@ -18,6 +117,12 @@ BarWidget {
   readonly property var service: bar && bar.shell && typeof bar.shell.serviceFor === "function"
     ? bar.shell.serviceFor("anishkn.mstodo")
     : null
+
+  // Minimum width for "next" display mode (horizontal only).
+  // Prevents panel shift when nextBarLine changes length.
+  readonly property int minBarWidth: (!root.vertical && root.displayMode === "next")
+    ? parseInt(setting("minBarWidth", 200), 10)
+    : -1
 
   readonly property bool signedIn: service ? service.signedIn : false
   readonly property int overdueCount: service ? service.overdueCount : 0
@@ -135,6 +240,9 @@ BarWidget {
     if (panelLoader.item) panelLoader.item.closeForPopoutSwitch()
   }
 
+  // Minimum width only for "next" display mode (horizontal) to prevent
+  // panel shift when nextBarLine changes length. Other modes use natural width.
+  Layout.minimumWidth: root.minBarWidth
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
@@ -169,9 +277,9 @@ BarWidget {
     bar: root.bar
     // In icon mode the Text still holds the glyph so its advance width
     // keeps the slot sized; labelVisible only stops the double render.
-    text: root.vertical ? "" : (root.iconOnly ? root.glyph : root.displayText)
-    labelVisible: !root.vertical && !root.iconOnly
-    hasVisualContent: root.vertical ? root.verticalLines.length > 0 : text !== ""
+    text: root.vertical ? "" : (root.iconOnly ? root.glyph : (root.displayMode === "next" ? "" : root.displayText))
+    labelVisible: !root.vertical && !root.iconOnly && root.displayMode !== "next"
+    hasVisualContent: root.vertical ? root.verticalLines.length > 0 : (root.displayMode === "next" || text !== "")
     fixedHeight: root.vertical ? root.verticalLines.length * Style.bar.iconSlot : -1
 
     // Late work is the one state worth spending the bar's urgent color on —
@@ -197,6 +305,21 @@ BarWidget {
     onPressed: function(b) {
       if (b === Qt.RightButton) root.cycleMode()
       else root.togglePanel()
+    }
+
+    // Marquee text for "next" display mode (horizontal only).
+    // Shows full nextBarLine with scrolling when it exceeds available width.
+    MarqueeText {
+      id: marquee
+      visible: !root.vertical && !root.iconOnly && root.displayMode === "next" && root.hasLine
+      anchors.fill: parent
+      anchors.leftMargin: Style.space(4)
+      anchors.rightMargin: Style.space(4)
+      text: root.nextLine
+      fontPixelSize: button.fontSize
+      fontFamily: button.fontFamily
+      color: button.active && button.useActiveColor ? button.activeColor : button.foreground
+      enabled: root.hasLine
     }
 
     // Icon-only view: the hidden label still sizes the slot off its advance

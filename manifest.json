@@ -33,7 +33,8 @@
       "longBreakMinutes": 15,
       "longBreakInterval": 4,
       "autoChain": true,
-      "pomoNotifications": true
+      "pomoNotifications": true,
+      "minBarWidth": 200
     },
     "schema": [
       {
@@ -139,13 +140,23 @@
         "description": "When a focus block or break ends, start the next phase on its own instead of waiting for you to press play.",
         "defaultValue": true
       },
-      {
-        "key": "pomoNotifications",
-        "type": "boolean",
-        "label": "Focus notifications",
-        "description": "Send a desktop toast when a focus block or break finishes.",
-        "defaultValue": true
-      }
+{
+         "key": "pomoNotifications",
+         "type": "boolean",
+         "label": "Focus notifications",
+         "description": "Send a desktop toast when a focus block or break finishes.",
+         "defaultValue": true
+       },
+       {
+         "key": "minBarWidth",
+         "type": "integer",
+         "label": "Minimum bar width (px)",
+         "description": "Reserved space for the next-task line in 'next' display mode. Prevents panel shift when task titles change length. Only applies when display mode is 'next' and bar is horizontal.",
+         "min": 100,
+         "max": 400,
+         "step": 10,
+         "defaultValue": 200
+       }
     ]
   }
 }

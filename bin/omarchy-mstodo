@@ -1690,23 +1690,49 @@ def _create_or_update(task_id: str | None, line: str) -> int:
 # --------------------------------------------------------------------------
 # argument parsing
 
-def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="omarchy-mstodo", description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = parser.add_subparsers(dest="command")
+# Short description for main help (full docstring used for subcommand help)
+MAIN_HELP = """Microsoft To Do client for the Omarchy bar.
 
-    p_login = sub.add_parser("login", help="authenticate via microsoft.com/link")
+Commands:
+  login       authenticate via microsoft.com/link
+  logout      forget tokens
+  sync        refresh the on-disk cache
+  status      print the cache summary as JSON
+  list        list cached tasks
+  add         create a task from the quick-add grammar
+  update      rewrite an existing task
+  complete    mark a task done
+  uncomplete  reopen a completed task
+  snooze      move due + reminder of a task
+  delete      delete a task
+  settings    show or set plugin settings (run 'omarchy-mstodo settings -h' for options)
+
+Run 'omarchy-mstodo <command> -h' for command-specific help.
+"""
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="omarchy-mstodo", description=MAIN_HELP,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter,
+                                     add_help=True)
+    sub = parser.add_subparsers(dest="command", metavar="<command>")
+
+    p_login = sub.add_parser("login", help="authenticate via microsoft.com/link",
+                             description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p_login.add_argument("step", nargs="?", choices=["start", "poll", "cancel"], default=None,
                          help="machine steps: start prints the code as JSON, poll checks once, cancel aborts")
-    sub.add_parser("logout", help="forget stored tokens")
+    sub.add_parser("logout", help="forget stored tokens",
+                   description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 
-    p_sync = sub.add_parser("sync", help="refresh the on-disk cache")
+    p_sync = sub.add_parser("sync", help="refresh the on-disk cache",
+                            description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p_sync.add_argument("--max-age", type=float, default=None, metavar="SEC",
                         help="skip network when the cache is younger than SEC seconds")
 
-    sub.add_parser("status", help="print the cache summary as JSON")
+    sub.add_parser("status", help="print the cache summary as JSON",
+                   description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 
-    p_list = sub.add_parser("list", help="list tasks from the cache")
+    p_list = sub.add_parser("list", help="list tasks from the cache",
+                            description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p_list.add_argument("scope", nargs="?", default="",
                         choices=["", "overdue", "today", "upcoming", "all", "done"],
                         help="filter (default: open tasks grouped)")
@@ -1714,10 +1740,12 @@ def main(argv: list[str]) -> int:
                         help="include completed tasks")
     p_list.add_argument("--json", action="store_true", help="machine-readable output")
 
-    p_add = sub.add_parser("add", help="create a task from the quick-add grammar")
+    p_add = sub.add_parser("add", help="create a task from the quick-add grammar",
+                           description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p_add.add_argument("line")
 
-    p_update = sub.add_parser("update", help="rewrite an existing task from the grammar")
+    p_update = sub.add_parser("update", help="rewrite an existing task from the grammar",
+                              description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p_update.add_argument("task_id")
     p_update.add_argument("line")
 
@@ -1726,24 +1754,38 @@ def main(argv: list[str]) -> int:
         ("uncomplete", cmd_uncomplete, "reopen a completed task"),
         ("delete", cmd_delete, "delete a task"),
     ):
-        p = sub.add_parser(name, help=help_text)
+        p = sub.add_parser(name, help=help_text,
+                           description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
         p.add_argument("task_id")
 
-    p_snooze = sub.add_parser("snooze", help="move due + reminder of a task")
+    p_snooze = sub.add_parser("snooze", help="move due + reminder of a task",
+                              description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p_snooze.add_argument("task_id")
     p_snooze.add_argument("when", nargs="+", metavar="@WHEN")
 
-    p_settings = sub.add_parser("settings", help="show or set plugin settings")
+    p_settings = sub.add_parser("settings", help="show or set plugin settings",
+                                description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p_settings.add_argument("key", nargs="?", default=None, help="setting name")
     p_settings.add_argument("value", nargs="?", default=None, help="new value")
 
-    p_read_bounded = sub.add_parser("read-bounded", help="read file with size limit and symlink protection (internal)")
-    p_read_bounded.add_argument("path")
-    p_read_bounded.add_argument("max_bytes", type=int)
+    # Internal commands: hidden from main help, only shown with explicit -h
+    internal_commands = {"read-bounded", "seed-create"}
 
-    p_seed_create = sub.add_parser("seed-create", help="create state files atomically if missing (internal)")
-    p_seed_create.add_argument("files", nargs="+", metavar="PATH:CONTENT",
-                               help="path:default_content pairs (content is JSON)")
+    # Check for internal command BEFORE main parser validates choices
+    if argv and argv[0] in internal_commands:
+        cmd = argv[0]
+        if cmd == "read-bounded":
+            p = argparse.ArgumentParser(prog="omarchy-mstodo read-bounded", add_help=True)
+            p.add_argument("path")
+            p.add_argument("max_bytes", type=int)
+            internal_args = p.parse_args(argv[1:])
+            return cmd_read_bounded(internal_args)
+        elif cmd == "seed-create":
+            p = argparse.ArgumentParser(prog="omarchy-mstodo seed-create", add_help=True)
+            p.add_argument("files", nargs="+", metavar="PATH:CONTENT",
+                           help="path:default_content pairs (content is JSON)")
+            internal_args = p.parse_args(argv[1:])
+            return cmd_seed_create(internal_args)
 
     args = parser.parse_args(argv)
     handlers = {
@@ -1751,7 +1793,6 @@ def main(argv: list[str]) -> int:
         "list": cmd_list, "settings": cmd_settings,
         "add": cmd_add, "update": cmd_update, "complete": cmd_complete,
         "uncomplete": cmd_uncomplete, "delete": cmd_delete, "snooze": cmd_snooze,
-        "read-bounded": cmd_read_bounded, "seed-create": cmd_seed_create,
     }
     if args.command not in handlers:
         parser.print_help()
