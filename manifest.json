@@ -34,7 +34,7 @@
       "longBreakInterval": 4,
       "autoChain": true,
       "pomoNotifications": true,
-      "minBarWidth": 200
+      "maxLineChars": 34
     },
     "schema": [
       {
@@ -148,14 +148,14 @@
          "defaultValue": true
        },
        {
-         "key": "minBarWidth",
+         "key": "maxLineChars",
          "type": "integer",
-         "label": "Minimum bar width (px)",
-         "description": "Reserved space for the next-task line in 'next' display mode. Prevents panel shift when task titles change length. Only applies when display mode is 'next' and bar is horizontal.",
-         "min": 100,
-         "max": 400,
-         "step": 10,
-         "defaultValue": 200
+         "label": "Next-task line length (chars)",
+         "description": "How long the bar's \"next task\" line can get before it's truncated with an ellipsis. Also sets the bar slot's reserved width, so switching between shorter and longer tasks never shifts the bar or the panel.",
+         "min": 10,
+         "max": 60,
+         "step": 1,
+         "defaultValue": 34
        }
     ]
   }

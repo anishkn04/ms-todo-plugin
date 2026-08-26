@@ -4,12 +4,14 @@
 
 Bar UX polish and CLI help cleanup.
 
-- Layout shift fixed: panel anchored to bar button no longer jumps when
-  `nextBarLine` changes after task completion. Added configurable
-  `minBarWidth` setting (default 200px, range 100–400px) that reserves
-  space only for `displayMode === "next"` (horizontal).
-- Marquee text: `nextBarLine` now scrolls left→right→left when it exceeds
-  available width, pausing 2s at each end for readability.
+- Layout shift fixed: the bar button no longer resizes when `nextBarLine`
+  changes length after a task completes, so the panel anchored to it stops
+  jumping sideways. The "next" display mode now reserves a fixed slot width,
+  measured off the same character cap used to elide the line, instead of
+  sizing to whatever task title happens to be showing.
+- Added `maxLineChars` setting (default 34, range 10–60) controlling both
+  where the next-task line gets truncated and how wide the reserved slot is
+  — one knob, so the two can't drift out of sync.
 - Clean CLI help: internal commands (`read-bounded`, `seed-create`) hidden
   from main `--help`; short command list with pointer to subcommand `-h`;
   full descriptions still shown per subcommand.
