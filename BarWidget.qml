@@ -242,8 +242,8 @@ BarWidget {
 
   // Minimum width only for "next" display mode (horizontal) to prevent
   // panel shift when nextBarLine changes length. Other modes use natural width.
-  Layout.minimumWidth: root.minBarWidth
-  implicitWidth: button.implicitWidth
+  // Layout.minimumWidth doesn't work on root item; enforce via implicitWidth.
+  implicitWidth: root.minBarWidth > 0 ? Math.max(button.implicitWidth, root.minBarWidth) : button.implicitWidth
   implicitHeight: button.implicitHeight
 
   Loader {
