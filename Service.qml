@@ -102,7 +102,7 @@ Item {
       return
     }
     root.dataReadQueued = false
-    dataReadProc.command = root.cappedCmd(["read-bounded", root.statePath + "/data.json", String(root.dataReadLimit)], "stdout")
+    dataReadProc.command = root.cappedCmd(["read-bounded", root.statePath + "/data.json", String(root.dataReadLimit)], "stdout", root.dataCapBytes)
     dataReadProc.running = true
   }
 
@@ -153,7 +153,7 @@ Item {
       return
     }
     root.authReadQueued = false
-    authReadProc.command = root.cappedCmd(["read-bounded", root.statePath + "/auth.json", String(root.authReadLimit)], "stdout")
+    authReadProc.command = root.cappedCmd(["read-bounded", root.statePath + "/auth.json", String(root.authReadLimit)], "stdout", root.authCapBytes)
     authReadProc.running = true
   }
 
@@ -228,11 +228,15 @@ Item {
   // Caps are hardcoded constants to avoid any interpolation into the shell command.
   readonly property int errCapBytes: 8192     // an error message, generously
   readonly property int jsonCapBytes: 16384   // login status objects
+  readonly property int dataCapBytes: 262144  // data.json — 256 KiB
+  readonly property int authCapBytes: 16384   // auth.json — 16 KiB
+  readonly property int stateCapBytes: 4096   // notified/pomo — 4 KiB
 
-  function cappedCmd(args, capture) {
+  function cappedCmd(args, capture, capBytes) {
+    var cap = capBytes || (capture === "stdout" ? root.jsonCapBytes : root.errCapBytes)
     var redirect = capture === "stdout"
-      ? "2>/dev/null | head -c " + root.jsonCapBytes
-      : "2>&1 | head -c " + root.errCapBytes
+      ? "2>/dev/null | head -c " + cap
+      : "2>&1 | head -c " + cap
     return ["sh", "-c",
       'trap "kill -TERM -$$" TERM INT EXIT; set -o pipefail; "$0" "$@" ' + redirect,
       root.cli].concat(args)
@@ -637,7 +641,7 @@ Item {
 
   function readNotified() {
     if (notifiedReadProc.running) return
-    notifiedReadProc.command = root.cappedCmd(["read-bounded", root.statePath + "/notified.json", String(root.stateReadLimit)], "stdout")
+    notifiedReadProc.command = root.cappedCmd(["read-bounded", root.statePath + "/notified.json", String(root.stateReadLimit)], "stdout", root.stateCapBytes)
     notifiedReadProc.running = true
   }
 
@@ -851,7 +855,7 @@ Item {
 
   function readPomo() {
     if (pomoReadProc.running) return
-    pomoReadProc.command = root.cappedCmd(["read-bounded", root.statePath + "/pomo.json", String(root.stateReadLimit)], "stdout")
+    pomoReadProc.command = root.cappedCmd(["read-bounded", root.statePath + "/pomo.json", String(root.stateReadLimit)], "stdout", root.stateCapBytes)
     pomoReadProc.running = true
   }
 
