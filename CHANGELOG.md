@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.3 — 2026-08-26
+
+Bar UX polish and CLI help cleanup.
+
+- Layout shift fixed: panel anchored to bar button no longer jumps when
+  `nextBarLine` changes after task completion. Added configurable
+  `minBarWidth` setting (default 200px, range 100–400px) that reserves
+  space only for `displayMode === "next"` (horizontal).
+- Marquee text: `nextBarLine` now scrolls left→right→left when it exceeds
+  available width, pausing 2s at each end for readability.
+- Clean CLI help: internal commands (`read-bounded`, `seed-create`) hidden
+  from main `--help`; short command list with pointer to subcommand `-h`;
+  full descriptions still shown per subcommand.
+
 ## 0.3.2 — 2026-08-25
 
 Security hardening and test suite fixes (follow-up).
