@@ -121,3 +121,38 @@ test('parsePomoState falls back to the empty day on junk or partial data', () =>
   assert.deepEqual(Model.parsePomoState('nope'), { dateKey: '', blocks: 0, minutes: 0 })
   assert.deepEqual(Model.parsePomoState('{"blocks": "two"}'), { dateKey: '', blocks: 0, minutes: 0 })
 })
+
+// --- safeTodoWebUrl ------------------------------------------------------
+//
+// The web-app URL is a hard-coded constant; safeTodoWebUrl is a no-op defence
+// in depth. If a future refactor ever templated the URL, this allowlist must
+// fail closed (return "") rather than open a redirected host.
+
+test('TODO_WEB_URL is the expected hard-coded constant', () => {
+  assert.equal(Model.TODO_WEB_URL, 'https://to-do.live.com/tasks/today')
+})
+
+test('safeTodoWebUrl accepts the hard-coded URL', () => {
+  assert.equal(
+    Model.safeTodoWebUrl('https://to-do.live.com/tasks/today'),
+    'https://to-do.live.com/tasks/today'
+  )
+})
+
+test('safeTodoWebUrl rejects everything else (fail-closed)', () => {
+  for (const bad of [
+    '',
+    null,
+    undefined,
+    'http://to-do.live.com/tasks/today',         // http not https
+    'https://to-do.live.com/tasks/today/',       // trailing slash
+    'https://to-do.live.com/tasks/today?evil=1', // smuggled query
+    'https://to-do.office.com/tasks/today',      // wrong host
+    'https://to-do.live.com.evil.example/tasks/today',
+    'https://evil.example/tasks/today',
+    'javascript:alert(1)',
+    'file:///etc/passwd',
+  ]) {
+    assert.equal(Model.safeTodoWebUrl(bad), '', `should reject: ${bad}`)
+  }
+})

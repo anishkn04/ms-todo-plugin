@@ -937,6 +937,44 @@ Panel {
               }
             }
           }
+
+          // ---- open in browser ------------------------------------------
+          // Always visible: the web app is the one place you can see ALL
+          // your tasks (including the longer Later view the panel hides).
+          // The URL is a hard-coded constant; safeTodoWebUrl is a no-op
+          // defence in depth so a future refactor that ever templated
+          // the URL would fail closed (button does nothing) rather than
+          // open a redirected host.
+          PanelSeparator { width: parent.width; foreground: root.fg }
+
+          Item {
+            width: parent.width
+            height: Style.space(32)
+
+            Button {
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(2)
+              anchors.verticalCenter: parent.verticalCenter
+              text: "Open MS To Do in browser"
+              bordered: true
+              foreground: root.fg
+              fontFamily: root.contentFontFamily
+              fontSize: Style.font.bodySmall
+              onClicked: if (Model.safeTodoWebUrl(Model.TODO_WEB_URL) !== "")
+                           Qt.openUrlExternally(Model.TODO_WEB_URL)
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(2)
+              anchors.verticalCenter: parent.verticalCenter
+              text: "opens microsoft.com in your browser"
+              color: root.muted
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
         }
       }
     }

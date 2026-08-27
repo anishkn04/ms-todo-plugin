@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.4 — 2026-08-27
+
+Panel footer link to the web app.
+
+- New footer "Open MS To Do in browser" button below the help overlay.
+  Hard-coded `https://to-do.live.com/tasks/today`; defence-in-depth regex
+  allowlist in `Model.safeTodoWebUrl` fails closed if the constant is
+  ever templated. Always visible, mouse-only.
+
 ## 0.3.3 — 2026-08-26
 
 Bar UX polish and CLI help cleanup.

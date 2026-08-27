@@ -123,9 +123,10 @@ anything unrecognized stays in the title.
 
 ## Panel
 
-Four zones, top to bottom: header (sync + help buttons), quick-add, the open
-list grouped into **Overdue / Today**, and the **FOCUS** timer. Later work
-stays out of the way — it lives in any To Do app or `omarchy-mstodo list`.
+Five zones, top to bottom: header (sync + help buttons), quick-add, the open
+list grouped into **Overdue / Today**, the **FOCUS** timer, and a footer
+"Open MS To Do in browser" link. Later work stays out of the way — it lives
+in any To Do app, the web app, or `omarchy-mstodo list`.
 
 - Click a row to select it; double-click to edit it in the input (same
   grammar); click the circle to complete.

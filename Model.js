@@ -57,6 +57,17 @@ function safeLoginUri(uri) {
   return LOGIN_URI_RE.test(s) ? s : "https://microsoft.com/link"
 }
 
+// Hard-coded Office To Do web URL. Always visible at the panel footer.
+// This is intentionally NOT a setting: a configurable host would re-introduce
+// the open-redirect risk the allowlist below was written to close.
+var TODO_WEB_URL = "https://to-do.live.com/tasks/today"
+var TODO_WEB_RE = /^https:\/\/to-do\.live\.com\/tasks\/today$/
+
+function safeTodoWebUrl(url) {
+  var s = String(url || "")
+  return TODO_WEB_RE.test(s) ? s : ""
+}
+
 // ---- cache ---------------------------------------------------------------
 
 function parseJson(text) {
@@ -480,6 +491,8 @@ if (typeof module !== "undefined") {
     elide: elide,
     plain: plain,
     safeLoginUri: safeLoginUri,
+    TODO_WEB_URL: TODO_WEB_URL,
+    safeTodoWebUrl: safeTodoWebUrl,
     parseJson: parseJson,
     parseCache: parseCache,
     parseNotified: parseNotified,
